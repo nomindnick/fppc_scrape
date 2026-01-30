@@ -1,0 +1,21 @@
+# Downloaded PDFs (too large for git)
+raw_pdfs/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Data files that might get large
+*.db
+data/*.json
+data/*.jsonl
+
+# OS files
+.DS_Store
+
+# Editor
+.vscode/
+.idea/
