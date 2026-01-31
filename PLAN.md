@@ -6,9 +6,11 @@ Scrape all ~16,000 FPPC advice letters (1975-2025), extract text, and store in a
 
 ---
 
-## Phase 1: Build Document Registry
+## Phase 1: Build Document Registry ✓ COMPLETE
 
 **Objective:** Crawl all search result pages and build a SQLite database of document metadata before downloading any PDFs.
+
+**Status:** Complete - 14,132 documents indexed across 51 years (1975-2025)
 
 ### Why Registry First?
 - Resumability: can stop/restart without losing progress
@@ -110,11 +112,20 @@ python -m scraper.crawler --clear-checkpoint  # Clear checkpoint
 - Checkpoint saves after each page for resume
 - Duplicate detection via UNIQUE constraint on pdf_url
 
-### Estimated Time
-- ~14 seconds per page
-- ~1,622 total pages
-- ~6-7 hours for full crawl (with delays)
-- Can run overnight
+### Final Crawl Results
+
+**Total: 14,132 documents** across 51 years (1975-2025)
+
+| Decade | Documents | Notes |
+|--------|-----------|-------|
+| 1975-1979 | 1,171 | Earliest records |
+| 1980-1989 | 3,380 | Peak year: 1990 (1,109 docs) |
+| 1990-1999 | 4,671 | Busiest decade |
+| 2000-2009 | 2,473 | |
+| 2010-2019 | 1,954 | |
+| 2020-2025 | 670 | Through Jan 2025 |
+
+**Runtime:** ~2.5 hours total (two crawl runs)
 
 ---
 
@@ -134,9 +145,9 @@ python -m scraper.crawler --clear-checkpoint  # Clear checkpoint
 - [ ] Handle failures gracefully (mark as 'failed', continue)
 
 ### Storage Estimate
-- ~16,000 documents
+- 14,132 documents (actual count from registry)
 - Average ~300KB each (based on samples: 127KB to 933KB)
-- Total: ~5GB
+- Total: ~4-5GB estimated
 
 ### Estimated Time
 - 2-3 seconds per download
@@ -328,11 +339,12 @@ JSON structure:
    - ~~Verify we capture all documents~~
    - ~~Check for edge cases (last page, empty results)~~
 
-3. **Run full registry crawl**
-   - Run: `python -m scraper.crawler --all`
-   - Monitor for issues, can resume if interrupted
-   - ~6-7 hours estimated
+3. ~~**Run full registry crawl**~~ ✓ DONE
+   - ~~14,132 documents indexed~~
+   - ~~51 years covered (1975-2025)~~
+   - ~~~2.5 hours runtime~~
 
 4. **Begin Phase 2: Download PDFs**
-   - After registry is complete, start downloading PDFs
    - Build downloader module with same patterns (retry, checkpoint)
+   - Download all 14,132 PDFs to `raw_pdfs/{year}/`
+   - Update database with download status, size, hash
