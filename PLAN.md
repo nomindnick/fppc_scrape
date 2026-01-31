@@ -75,16 +75,40 @@ CREATE INDEX idx_extraction_status ON documents(extraction_status);
 
 ### Tasks
 
-- [ ] Create SQLite database with schema
-- [ ] Write crawler that:
-  - [ ] Iterates years (1975-2025)
-  - [ ] For each year, paginates through all results
-  - [ ] Parses each result (title, PDF URL, tags)
-  - [ ] Inserts into database (skip if URL exists)
-  - [ ] Logs progress
-- [ ] Add rate limiting (3-5 second delays)
-- [ ] Add checkpoint/resume logic (track last completed year+page)
-- [ ] Test on 2-3 years before full run
+- [x] Create SQLite database with schema
+- [x] Write crawler that:
+  - [x] Iterates years (1975-2025)
+  - [x] For each year, paginates through all results
+  - [x] Parses each result (title, PDF URL, tags)
+  - [x] Inserts into database (skip if URL exists)
+  - [x] Logs progress
+- [x] Add rate limiting (4 second delays)
+- [x] Add checkpoint/resume logic (track last completed year+page)
+- [x] Test on 2-3 years before full run
+
+### Implementation
+
+Created `scraper/` module with:
+- `config.py` - Configuration constants (URLs, delays, paths)
+- `db.py` - Database setup and operations
+- `parser.py` - HTML parsing and title metadata extraction
+- `crawler.py` - Main crawler with CLI interface
+
+**CLI Commands:**
+```bash
+python -m scraper.crawler --init          # Initialize database
+python -m scraper.crawler --year 2024     # Crawl specific year
+python -m scraper.crawler --all           # Full crawl with resume
+python -m scraper.crawler --stats         # Show statistics
+python -m scraper.crawler --clear-checkpoint  # Clear checkpoint
+```
+
+**Tested:**
+- Year 2024 (modern format): 82 documents, rich metadata parsed
+- Year 2000 (sparse format): Letter IDs extracted correctly
+- Retry logic handles intermittent network failures
+- Checkpoint saves after each page for resume
+- Duplicate detection via UNIQUE constraint on pdf_url
 
 ### Estimated Time
 - ~14 seconds per page
@@ -294,17 +318,21 @@ JSON structure:
 
 ## Next Immediate Steps
 
-1. **Create database and crawler skeleton**
-   - Set up SQLite with schema
-   - Write basic pagination + parsing
-   - Test on one year
+1. ~~**Create database and crawler skeleton**~~ ✓ DONE
+   - ~~Set up SQLite with schema~~
+   - ~~Write basic pagination + parsing~~
+   - ~~Test on one year~~
 
-2. **Test pagination thoroughly**
-   - Walk all pages of a small year (e.g., 2024 with 82 results)
-   - Verify we capture all documents
-   - Check for edge cases (last page, empty results)
+2. ~~**Test pagination thoroughly**~~ ✓ DONE
+   - ~~Walk all pages of a small year (e.g., 2024 with 82 results)~~
+   - ~~Verify we capture all documents~~
+   - ~~Check for edge cases (last page, empty results)~~
 
 3. **Run full registry crawl**
-   - Start with recent years (better metadata)
-   - Let it run, monitor for issues
+   - Run: `python -m scraper.crawler --all`
+   - Monitor for issues, can resume if interrupted
    - ~6-7 hours estimated
+
+4. **Begin Phase 2: Download PDFs**
+   - After registry is complete, start downloading PDFs
+   - Build downloader module with same patterns (retry, checkpoint)
