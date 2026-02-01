@@ -21,6 +21,7 @@ from .config import (
     YEAR_FILTER,
 )
 from .db import get_stats, get_year_count, init_db, insert_document
+from .downloader import download_pending, print_download_stats
 from .parser import (
     extract_year_from_tags,
     extract_year_from_url,
@@ -310,6 +311,23 @@ def main():
         help="Override start year for --all (ignores checkpoint)",
     )
 
+    # Download arguments
+    parser.add_argument(
+        "--download",
+        action="store_true",
+        help="Download all pending PDFs",
+    )
+    parser.add_argument(
+        "--download-year",
+        type=int,
+        help="Download PDFs for a specific year only",
+    )
+    parser.add_argument(
+        "--download-stats",
+        action="store_true",
+        help="Show download progress statistics",
+    )
+
     args = parser.parse_args()
 
     if args.init:
@@ -332,6 +350,18 @@ def main():
     if args.all:
         init_db()  # Ensure DB exists
         crawl_all(start_year=args.start_year)
+        return
+
+    if args.download_stats:
+        print_download_stats()
+        return
+
+    if args.download_year:
+        download_pending(year=args.download_year)
+        return
+
+    if args.download:
+        download_pending()
         return
 
     # No arguments - show help

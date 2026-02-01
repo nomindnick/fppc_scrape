@@ -186,3 +186,126 @@ def check_duplicates() -> list[tuple[str, int]]:
     duplicates = [(row["pdf_url"], row["count"]) for row in cursor.fetchall()]
     conn.close()
     return duplicates
+
+
+def get_pending_downloads(year: int | None = None, limit: int | None = None) -> list[dict]:
+    """
+    Query documents with download_status='pending'.
+
+    Args:
+        year: Optional year filter
+        limit: Optional limit on number of results
+
+    Returns:
+        List of document dicts with id, pdf_url, year_tag
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    query = "SELECT id, pdf_url, year_tag FROM documents WHERE download_status = 'pending'"
+    params: list = []
+
+    if year is not None:
+        query += " AND year_tag = ?"
+        params.append(year)
+
+    query += " ORDER BY year_tag DESC, id"
+
+    if limit is not None:
+        query += " LIMIT ?"
+        params.append(limit)
+
+    cursor.execute(query, params)
+    results = [dict(row) for row in cursor.fetchall()]
+    conn.close()
+    return results
+
+
+def update_download_status(
+    doc_id: int,
+    status: str,
+    size: int | None = None,
+    sha256: str | None = None,
+) -> None:
+    """
+    Update a document's download status, size, hash, and timestamps.
+
+    Args:
+        doc_id: Document ID
+        status: New download status ('downloaded', 'failed', 'pending')
+        size: PDF file size in bytes
+        sha256: SHA256 hash of the PDF
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    if status == "downloaded":
+        cursor.execute(
+            """
+            UPDATE documents
+            SET download_status = ?,
+                pdf_size_bytes = ?,
+                pdf_sha256 = ?,
+                downloaded_at = CURRENT_TIMESTAMP,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (status, size, sha256, doc_id),
+        )
+    else:
+        cursor.execute(
+            """
+            UPDATE documents
+            SET download_status = ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (status, doc_id),
+        )
+
+    conn.commit()
+    conn.close()
+
+
+def get_download_stats() -> dict:
+    """
+    Get download-specific statistics.
+
+    Returns:
+        Dict with pending, downloaded, failed counts and total size
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    stats = {}
+
+    # Counts by status
+    cursor.execute("""
+        SELECT download_status, COUNT(*) as count
+        FROM documents
+        GROUP BY download_status
+    """)
+    for row in cursor.fetchall():
+        stats[row["download_status"]] = row["count"]
+
+    # Total downloaded size
+    cursor.execute("""
+        SELECT SUM(pdf_size_bytes) as total_size
+        FROM documents
+        WHERE download_status = 'downloaded'
+    """)
+    result = cursor.fetchone()
+    stats["total_size_bytes"] = result["total_size"] or 0
+
+    # By year (pending only)
+    cursor.execute("""
+        SELECT year_tag, COUNT(*) as count
+        FROM documents
+        WHERE download_status = 'pending'
+        GROUP BY year_tag
+        ORDER BY year_tag DESC
+    """)
+    stats["pending_by_year"] = {row["year_tag"]: row["count"] for row in cursor.fetchall()}
+
+    conn.close()
+    return stats

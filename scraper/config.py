@@ -22,6 +22,10 @@ HEADERS = {"User-Agent": "FPPC-Research-Bot/1.0 (academic research)"}
 DB_PATH = DATA_DIR / "documents.db"
 CHECKPOINT_PATH = DATA_DIR / "checkpoint.json"
 
+# PDF Downloads
+RAW_PDFS_DIR = PROJECT_ROOT / "raw_pdfs"
+DOWNLOAD_DELAY = 3  # Slightly faster than crawl since we're hitting CDN
+
 # Year range
 START_YEAR = 1975
 END_YEAR = 2025
