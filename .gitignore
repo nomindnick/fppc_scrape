@@ -1,6 +1,9 @@
 # Downloaded PDFs (too large for git)
 raw_pdfs/
 
+# Environment secrets
+.env
+
 # Python
 __pycache__/
 *.pyc
