@@ -11,9 +11,37 @@ This document provides the complete implementation plan for Phase 3 of the FPPC 
 
 ### Phase 3 Goals
 1. Extract text from all PDFs (native extraction + olmOCR fallback)
-2. Parse document sections (QUESTION, CONCLUSION, FACTS, ANALYSIS)
-3. Extract legal citations (Government Code, Regulations, prior opinions)
-4. Output structured JSON files ready for search/embedding
+2. Classify document types (filter non-opinion documents)
+3. Parse document sections with validation (QUESTION, CONCLUSION, FACTS, ANALYSIS)
+4. Use LLM to generate synthetic Q&A for documents without standard structure
+5. Extract legal citations (Government Code, Regulations, prior opinions)
+6. Output structured JSON files ready for search/embedding
+
+### Key Design Decisions
+- **Two-phase approach**: Conservative extraction first, LLM enhancement second
+- **Validation over regex**: Section extraction includes confidence scoring
+- **Synthetic Q&A**: All documents get searchable Q&A content (extracted or LLM-generated)
+- **Era-aware processing**: Different strategies for pre-1988 vs modern documents
+
+---
+
+## Implementation Tasks
+
+The implementation is divided into discrete, sequential tasks:
+
+| Task | Module | Description | Dependencies |
+|------|--------|-------------|--------------|
+| **3.1** | `schema.py` | Define all dataclasses | None |
+| **3.2** | `quality.py` | Text quality scoring | None |
+| **3.3** | `section_parser.py` | Regex section extraction with validation | None |
+| **3.4** | `citation_extractor.py` | Legal citation extraction | None |
+| **3.5** | `classifier.py` | Heuristic topic classification | 3.4 |
+| **3.6** | `db.py` additions | Add extraction tracking columns | None |
+| **3.7** | `extractor.py` | Core extraction pipeline (Phase 3A) | 3.1-3.6 |
+| **3.8** | Review & calibrate | Manual review of 50-doc sample | 3.7 |
+| **3.9** | `llm_extractor.py` | LLM-based section extraction | 3.8 |
+| **3.10** | Full extraction run | Process all 14,096 documents | 3.9 |
+| **3.11** | Post-processing | Build citation graph, compute `cited_by` | 3.10 |
 
 ---
 
@@ -62,16 +90,26 @@ class ParsedMetadata:
     requestor_name: str | None
     requestor_title: str | None       # e.g., "City Attorney"
     requestor_city: str | None
-    letter_type: Literal["formal", "informal", "opinion"] | None
+    document_type: Literal["advice_letter", "opinion", "informal_advice",
+                           "correspondence", "other", "unknown"]
 
 @dataclass
 class Sections:
     """Structured sections from the document."""
+    # Extracted content (null if not found via regex)
     question: str | None              # The QUESTION section
     conclusion: str | None            # The CONCLUSION/SHORT ANSWER
     facts: str | None                 # The FACTS section
     analysis: str | None              # The ANALYSIS section
-    has_standard_format: bool         # True if Q/C sections were found
+
+    # Synthetic content (LLM-generated if extraction failed)
+    question_synthetic: str | None    # Generated question for docs without Q section
+    conclusion_synthetic: str | None  # Generated conclusion for docs without C section
+
+    # Extraction metadata
+    extraction_method: Literal["regex", "regex_validated", "llm", "none"]
+    extraction_confidence: float      # 0.0-1.0
+    has_standard_format: bool         # True if Q/C sections were found via regex
     parsing_notes: str | None         # Any issues encountered
 
 @dataclass
@@ -80,26 +118,27 @@ class Citations:
     government_code: list[str]        # ["87100", "87103(a)", "87200"]
     regulations: list[str]            # ["18700", "18702.1", "18730"]
     prior_opinions: list[str]         # ["A-23-001", "I-22-015"]
-    external: list[str]               # Other citations
+    cited_by: list[str]               # Opinions that cite THIS document (populated in post-processing)
+    external: list[str]               # Court cases and other citations
 
 @dataclass
 class Classification:
-    """Topic classification (populated in Phase 4)."""
-    topic_primary: Literal["conflicts_of_interest", "campaign_finance", "lobbying", "other"] | None
+    """Topic classification."""
+    topic_primary: Literal["conflicts_of_interest", "campaign_finance",
+                           "lobbying", "other"] | None
     topic_secondary: str | None
     topic_tags: list[str]             # Granular tags
     confidence: float | None          # Classification confidence
     classified_at: str | None
-    classification_method: str | None # "heuristic", "llm:claude-3-sonnet", etc.
+    classification_method: str | None # "heuristic:citation_based", "llm:claude-haiku", etc.
 
 @dataclass
-class Generated:
-    """LLM-generated content (populated in Phase 4)."""
-    question_synthetic: str | None    # For docs without clear Q section
-    answer_synthetic: str | None      # For docs without clear A section
-    summary: str | None               # Brief summary of the opinion
-    generated_at: str | None
-    generation_model: str | None
+class EmbeddingContent:
+    """Pre-computed content optimized for embedding generation."""
+    qa_text: str                      # question + conclusion (extracted or synthetic)
+    qa_source: Literal["extracted", "synthetic", "mixed"]
+    first_500_words: str              # Fallback for docs with no structure
+    summary: str | None               # LLM-generated summary (optional)
 
 @dataclass
 class FPPCDocument:
@@ -119,7 +158,7 @@ class FPPCDocument:
     sections: Sections
     citations: Citations
     classification: Classification
-    generated: Generated
+    embedding: EmbeddingContent
 ```
 
 ### Example JSON Output
@@ -161,14 +200,18 @@ class FPPCDocument:
     "requestor_name": "Alan J. Peake",
     "requestor_title": null,
     "requestor_city": "Bakersfield",
-    "letter_type": "formal"
+    "document_type": "advice_letter"
   },
 
   "sections": {
-    "question": "Whether a City Council Member who is employed by a company that provides water well services must recuse himself from decisions affecting water infrastructure.",
-    "conclusion": "Yes, the Council Member must recuse himself from decisions that would have a reasonably foreseeable material financial effect on his employer.",
+    "question": "Whether a City Council Member who is employed by a company...",
+    "conclusion": "Yes, the Council Member must recuse himself from decisions...",
     "facts": "You state that you are a member of the Bakersfield City Council...",
     "analysis": "Government Code Section 87100 prohibits a public official from...",
+    "question_synthetic": null,
+    "conclusion_synthetic": null,
+    "extraction_method": "regex_validated",
+    "extraction_confidence": 0.95,
     "has_standard_format": true,
     "parsing_notes": null
   },
@@ -177,6 +220,7 @@ class FPPCDocument:
     "government_code": ["87100", "87103", "87103(a)", "82030"],
     "regulations": ["18700", "18701", "18702.1", "18702.2"],
     "prior_opinions": ["A-23-142", "A-22-088"],
+    "cited_by": ["A-24-089", "A-25-012"],
     "external": []
   },
 
@@ -189,12 +233,11 @@ class FPPCDocument:
     "classification_method": "heuristic:citation_based"
   },
 
-  "generated": {
-    "question_synthetic": null,
-    "answer_synthetic": null,
-    "summary": null,
-    "generated_at": null,
-    "generation_model": null
+  "embedding": {
+    "qa_text": "QUESTION: Whether a City Council Member who is employed by a company that provides water well services must recuse himself from decisions affecting water infrastructure.\n\nCONCLUSION: Yes, the Council Member must recuse himself from decisions that would have a reasonably foreseeable material financial effect on his employer.",
+    "qa_source": "extracted",
+    "first_500_words": "STATE OF CALIFORNIA FAIR POLITICAL PRACTICES COMMISSION...",
+    "summary": null
   }
 }
 ```
@@ -223,100 +266,890 @@ fppc_scrape/
 └── scraper/
     ├── __init__.py
     ├── config.py                    # Existing config
-    ├── db.py                        # Existing DB operations
+    ├── db.py                        # Existing + new extraction columns
     ├── crawler.py                   # Existing crawler
     ├── downloader.py                # Existing downloader
-    ├── schema.py                    # NEW: Pydantic/dataclass models
-    ├── extractor.py                 # NEW: Core extraction logic
-    ├── section_parser.py            # NEW: Section extraction
-    ├── citation_extractor.py        # NEW: Citation extraction
-    └── quality.py                   # NEW: Quality scoring
+    ├── schema.py                    # Task 3.1: Pydantic/dataclass models
+    ├── quality.py                   # Task 3.2: Quality scoring
+    ├── section_parser.py            # Task 3.3: Section extraction
+    ├── citation_extractor.py        # Task 3.4: Citation extraction
+    ├── classifier.py                # Task 3.5: Topic classification
+    ├── extractor.py                 # Task 3.7: Core extraction pipeline
+    └── llm_extractor.py             # Task 3.9: LLM-based extraction
 ```
 
 ---
 
-## Phase 3A: Core Extraction
+## Task 3.1: Schema Module
 
-### Decision Logic
+**File**: `scraper/schema.py`
+
+Defines all dataclasses as shown above. Uses Python dataclasses (not Pydantic) for simplicity, with a `to_dict()` helper for JSON serialization.
 
 ```python
-def should_use_olmocr(doc_record, native_result) -> bool:
+# scraper/schema.py
+
+"""
+Data models for FPPC document extraction.
+
+Usage:
+    from scraper.schema import FPPCDocument, Sections, Citations
+"""
+
+from dataclasses import dataclass, field, asdict
+from typing import Literal
+import json
+
+# [All dataclass definitions from above]
+
+def to_json(doc: FPPCDocument, indent: int = 2) -> str:
+    """Serialize an FPPCDocument to JSON."""
+    return json.dumps(asdict(doc), indent=indent, ensure_ascii=False)
+
+def from_json(json_str: str) -> FPPCDocument:
+    """Deserialize JSON to an FPPCDocument."""
+    data = json.loads(json_str)
+    # Reconstruct nested dataclasses
+    # [Implementation details]
+```
+
+---
+
+## Task 3.2: Quality Scoring
+
+**File**: `scraper/quality.py`
+
+```python
+# scraper/quality.py
+
+"""
+Compute quality scores for extracted text.
+
+Quality score is 0.0-1.0, based on:
+- Words per page (expect 200-500 for legal docs)
+- Alphabetic character ratio
+- Presence of expected patterns (dates, "FPPC", section headers)
+- Absence of OCR artifacts (garbled text)
+"""
+
+import re
+from dataclasses import dataclass
+
+@dataclass
+class QualityMetrics:
+    """Detailed quality metrics for debugging."""
+    words_per_page: float
+    alpha_ratio: float
+    has_date: bool
+    has_fppc_mention: bool
+    has_section_headers: bool
+    garbage_ratio: float
+    final_score: float
+
+
+def compute_quality_score(text: str, page_count: int) -> QualityMetrics:
+    """
+    Compute quality metrics for extracted text.
+
+    Returns QualityMetrics with individual scores and final weighted score.
+    """
+    if not text or page_count == 0:
+        return QualityMetrics(0, 0, False, False, False, 1.0, 0.0)
+
+    word_count = len(text.split())
+    words_per_page = word_count / page_count
+
+    # Alpha ratio
+    alpha_chars = sum(1 for c in text if c.isalpha())
+    alpha_ratio = alpha_chars / len(text) if text else 0
+
+    # Expected patterns
+    has_date = bool(re.search(
+        r'(January|February|March|April|May|June|July|August|'
+        r'September|October|November|December)\s+\d{1,2},?\s+\d{4}',
+        text
+    ))
+    has_fppc = bool(re.search(r'FPPC|Fair Political|Political Practices', text, re.I))
+    has_section = bool(re.search(r'\b(QUESTION|CONCLUSION|ANALYSIS|FACTS)\b', text, re.I))
+
+    # OCR artifact detection
+    long_words = sum(1 for w in text.split() if len(w) > 25)
+    garbage_ratio = long_words / word_count if word_count else 0
+
+    # Compute component scores
+    scores = []
+
+    # Words per page score
+    if words_per_page >= 200:
+        scores.append(1.0)
+    elif words_per_page >= 100:
+        scores.append(0.7)
+    elif words_per_page >= 50:
+        scores.append(0.4)
+    else:
+        scores.append(0.1)
+
+    # Alpha ratio score
+    if alpha_ratio >= 0.7:
+        scores.append(1.0)
+    elif alpha_ratio >= 0.5:
+        scores.append(0.6)
+    else:
+        scores.append(0.2)
+
+    # Pattern score
+    pattern_score = (int(has_date) + int(has_fppc) + int(has_section)) / 3
+    scores.append(pattern_score)
+
+    # Artifact penalty
+    if garbage_ratio < 0.01:
+        scores.append(1.0)
+    elif garbage_ratio < 0.05:
+        scores.append(0.7)
+    else:
+        scores.append(0.3)
+
+    # Weighted average
+    weights = [0.3, 0.25, 0.25, 0.2]
+    final_score = sum(s * w for s, w in zip(scores, weights))
+
+    return QualityMetrics(
+        words_per_page=round(words_per_page, 1),
+        alpha_ratio=round(alpha_ratio, 3),
+        has_date=has_date,
+        has_fppc_mention=has_fppc,
+        has_section_headers=has_section,
+        garbage_ratio=round(garbage_ratio, 4),
+        final_score=round(final_score, 3)
+    )
+
+
+def should_use_olmocr(year: int, quality: QualityMetrics) -> bool:
     """Decide whether to use olmOCR for a document."""
 
     # Always use olmOCR for very old documents (likely scanned)
-    if doc_record.year_tag < 1990:
+    if year < 1990:
         return True
 
-    # Use olmOCR if native extraction failed
-    if native_result.word_count < 50:
+    # Use olmOCR if quality is poor
+    if quality.final_score < 0.5:
         return True
 
-    # Use olmOCR if quality indicators are poor
-    words_per_page = native_result.word_count / native_result.page_count
-    if words_per_page < 80:  # Too sparse, likely scan
+    # Use olmOCR if text is too sparse
+    if quality.words_per_page < 80:
         return True
 
     # Use olmOCR if alpha ratio is low (OCR garbage)
-    if native_result.alpha_ratio < 0.7:
+    if quality.alpha_ratio < 0.6:
         return True
-
-    # Suspicious: 1990-2005 era with no extracted date
-    if 1990 <= doc_record.year_tag <= 2005:
-        if not native_result.extracted_date:
-            return True
 
     return False
 ```
 
-### Extraction Module
+---
+
+## Task 3.3: Section Parser
+
+**File**: `scraper/section_parser.py`
+
+This module uses **validated regex extraction** with confidence scoring.
+
+```python
+# scraper/section_parser.py
+
+"""
+Parse structured sections from FPPC advice letters.
+
+Uses regex with validation to avoid false positives from common words
+like "question" and "conclusion" appearing in body text.
+
+Validation rules:
+1. QUESTION must appear before CONCLUSION in document
+2. Section headers must be near start of line (not mid-paragraph)
+3. Content between headers must be substantial (50+ words)
+4. Sections should appear in expected order
+"""
+
+import re
+from dataclasses import dataclass
+from typing import Literal
+
+@dataclass
+class SectionMatch:
+    """A potential section match with position info."""
+    section_type: str
+    header_text: str
+    header_start: int
+    content_start: int
+    content: str | None = None
+
+@dataclass
+class SectionResult:
+    """Result of section parsing."""
+    question: str | None
+    conclusion: str | None
+    facts: str | None
+    analysis: str | None
+    extraction_method: Literal["regex", "regex_validated", "none"]
+    extraction_confidence: float
+    has_standard_format: bool
+    parsing_notes: str | None
+
+
+# Section patterns ordered by specificity (most specific first)
+# Each pattern is (regex, section_type, era_hint)
+SECTION_PATTERNS = [
+    # Modern format (strict - requires newline or colon after)
+    (r'(?:^|\n)\s{0,4}QUESTIONS?\s*(?:\n|:)', 'question', 'modern'),
+    (r'(?:^|\n)\s{0,4}CONCLUSIONS?\s*(?:\n|:)', 'conclusion', 'modern'),
+    (r'(?:^|\n)\s{0,4}FACTS?\s*(?:\n|:)', 'facts', 'modern'),
+    (r'(?:^|\n)\s{0,4}ANALYSIS\s*(?:\n|:)', 'analysis', 'modern'),
+
+    # Older format variants
+    (r'(?:^|\n)\s{0,4}QUESTIONS?\s+PRESENTED\s*(?:\n|:)', 'question', 'old'),
+    (r'(?:^|\n)\s{0,4}ISSUES?\s+PRESENTED\s*(?:\n|:)', 'question', 'old'),
+    (r'(?:^|\n)\s{0,4}SHORT\s+ANSWERS?\s*(?:\n|:)', 'conclusion', 'old'),
+    (r'(?:^|\n)\s{0,4}ANSWERS?\s*\d*\s*(?:\n|:)', 'conclusion', 'old'),
+    (r'(?:^|\n)\s{0,4}DISCUSSION\s*(?:\n|:)', 'analysis', 'old'),
+    (r'(?:^|\n)\s{0,4}SUMMARY\s*(?:\n|:)', 'conclusion', 'old'),
+
+    # Numbered format (QUESTION 1, ANSWER 1, etc.)
+    (r'(?:^|\n)\s{0,4}QUESTION\s+\d+\s*[:\n]', 'question', 'numbered'),
+    (r'(?:^|\n)\s{0,4}ANSWER\s+\d+\s*[:\n]', 'conclusion', 'numbered'),
+]
+
+
+def parse_sections(text: str, year: int = None) -> SectionResult:
+    """
+    Extract structured sections from document text with validation.
+
+    Returns SectionResult with extracted content and confidence metrics.
+    """
+    if not text or len(text) < 100:
+        return SectionResult(
+            question=None, conclusion=None, facts=None, analysis=None,
+            extraction_method="none", extraction_confidence=0.0,
+            has_standard_format=False, parsing_notes="Text too short"
+        )
+
+    # Find all potential section matches
+    matches = _find_section_matches(text)
+
+    if not matches:
+        return SectionResult(
+            question=None, conclusion=None, facts=None, analysis=None,
+            extraction_method="none", extraction_confidence=0.0,
+            has_standard_format=False, parsing_notes="No section headers found"
+        )
+
+    # Validate and extract content
+    validated = _validate_and_extract(text, matches)
+
+    # Compute confidence
+    confidence = _compute_confidence(validated, year)
+
+    # Determine if we have standard format
+    has_standard = bool(validated.get('question') or validated.get('conclusion'))
+
+    # Build notes
+    notes = _build_parsing_notes(validated, matches)
+
+    return SectionResult(
+        question=validated.get('question'),
+        conclusion=validated.get('conclusion'),
+        facts=validated.get('facts'),
+        analysis=validated.get('analysis'),
+        extraction_method="regex_validated" if confidence >= 0.7 else "regex",
+        extraction_confidence=confidence,
+        has_standard_format=has_standard,
+        parsing_notes=notes
+    )
+
+
+def _find_section_matches(text: str) -> list[SectionMatch]:
+    """Find all potential section header matches."""
+    matches = []
+
+    for pattern, section_type, era in SECTION_PATTERNS:
+        for match in re.finditer(pattern, text, re.IGNORECASE | re.MULTILINE):
+            matches.append(SectionMatch(
+                section_type=section_type,
+                header_text=match.group().strip(),
+                header_start=match.start(),
+                content_start=match.end(),
+            ))
+
+    # Sort by position
+    matches.sort(key=lambda m: m.content_start)
+    return matches
+
+
+def _validate_and_extract(text: str, matches: list[SectionMatch]) -> dict:
+    """Validate matches and extract content."""
+
+    # Keep only first occurrence of each section type
+    seen = set()
+    unique_matches = []
+    for m in matches:
+        if m.section_type not in seen:
+            seen.add(m.section_type)
+            unique_matches.append(m)
+
+    # Validate order: question should come before conclusion
+    q_pos = next((m.content_start for m in unique_matches if m.section_type == 'question'), None)
+    c_pos = next((m.content_start for m in unique_matches if m.section_type == 'conclusion'), None)
+
+    if q_pos and c_pos and q_pos > c_pos:
+        # Question appears after conclusion - suspicious, might be false positive
+        # Keep conclusion but mark question as potentially invalid
+        pass  # For now, we still extract but note it
+
+    # Extract content for each section
+    result = {}
+    for i, match in enumerate(unique_matches):
+        # Find end of section (next section start or document end markers)
+        if i + 1 < len(unique_matches):
+            end_pos = unique_matches[i + 1].header_start
+        else:
+            end_pos = _find_section_end(text, match.content_start)
+
+        content = text[match.content_start:end_pos].strip()
+        content = _clean_section_content(content)
+
+        # Validate content length
+        if content and len(content.split()) >= 10:  # At least 10 words
+            result[match.section_type] = content
+
+    return result
+
+
+def _find_section_end(text: str, start: int) -> int:
+    """Find end of the last section."""
+    end_patterns = [
+        r'\n\s*Sincerely,',
+        r'\n\s*Very truly yours,',
+        r'\n\s*Respectfully,',
+        r'\n\s*Dave Bainbridge',  # Common FPPC signatory
+        r'\n\s*[A-Z][a-z]+\s+[A-Z]\.\s+[A-Z][a-z]+\s*\n.*?General Counsel',
+        r'\n\s*\*\s*\*\s*\*',
+    ]
+
+    search_text = text[start:]
+    min_end = len(text)
+
+    for pattern in end_patterns:
+        match = re.search(pattern, search_text, re.IGNORECASE)
+        if match:
+            min_end = min(min_end, start + match.start())
+
+    return min_end
+
+
+def _clean_section_content(content: str) -> str:
+    """Clean extracted section content."""
+    # Remove excessive whitespace
+    content = re.sub(r'\n{3,}', '\n\n', content)
+    content = re.sub(r'[ \t]+', ' ', content)
+
+    # Remove page numbers
+    content = re.sub(r'\n\s*-?\s*\d+\s*-?\s*\n', '\n', content)
+    content = re.sub(r'\n\s*Page\s+\d+\s*\n', '\n', content, flags=re.IGNORECASE)
+
+    # Remove header/footer artifacts
+    content = re.sub(r'\nFile No\.\s+[A-Z]-\d+-\d+\s*\n', '\n', content)
+    content = re.sub(r'\nPage No\.\s+\d+\s*\n', '\n', content)
+
+    return content.strip()
+
+
+def _compute_confidence(extracted: dict, year: int = None) -> float:
+    """Compute extraction confidence score."""
+    confidence = 0.0
+
+    # Base confidence from what we found
+    if extracted.get('question') and extracted.get('conclusion'):
+        confidence = 0.9
+    elif extracted.get('question') or extracted.get('conclusion'):
+        confidence = 0.6
+    elif extracted.get('analysis') or extracted.get('facts'):
+        confidence = 0.4
+
+    # Era adjustment
+    if year:
+        if year >= 2000:
+            confidence = min(confidence + 0.05, 1.0)  # Modern docs more reliable
+        elif year < 1985:
+            confidence = max(confidence - 0.2, 0.0)  # Old docs less reliable
+
+    return round(confidence, 2)
+
+
+def _build_parsing_notes(extracted: dict, matches: list[SectionMatch]) -> str | None:
+    """Build notes about parsing results."""
+    notes = []
+
+    if not extracted:
+        notes.append("No valid sections extracted")
+    elif not extracted.get('question') and not extracted.get('conclusion'):
+        notes.append("No Q/C sections found; may need LLM extraction")
+    elif extracted.get('question') and not extracted.get('conclusion'):
+        notes.append("Question found but no conclusion")
+
+    # Check for multiple matches of same type (might indicate false positives)
+    type_counts = {}
+    for m in matches:
+        type_counts[m.section_type] = type_counts.get(m.section_type, 0) + 1
+
+    duplicates = [t for t, c in type_counts.items() if c > 1]
+    if duplicates:
+        notes.append(f"Multiple matches for: {', '.join(duplicates)}")
+
+    return "; ".join(notes) if notes else None
+```
+
+---
+
+## Task 3.4: Citation Extractor
+
+**File**: `scraper/citation_extractor.py`
+
+```python
+# scraper/citation_extractor.py
+
+"""
+Extract legal citations from FPPC advice letters.
+
+Citation types:
+1. Government Code sections (Political Reform Act: §§ 81000-91014)
+2. FPPC Regulations (Title 2, CCR §§ 18000-18999)
+3. Prior FPPC advice letters and opinions
+4. External citations (court cases)
+"""
+
+import re
+from dataclasses import dataclass
+
+@dataclass
+class CitationResult:
+    """Extracted citations with metadata."""
+    government_code: list[str]
+    regulations: list[str]
+    prior_opinions: list[str]
+    external: list[str]
+    extraction_notes: str | None = None
+
+
+def extract_citations(text: str) -> CitationResult:
+    """Extract all legal citations from document text."""
+
+    gov_code = _extract_government_code(text)
+    regulations = _extract_regulations(text)
+    prior_opinions = _extract_prior_opinions(text)
+    external = _extract_external_citations(text)
+
+    return CitationResult(
+        government_code=sorted(set(gov_code)),
+        regulations=sorted(set(regulations)),
+        prior_opinions=sorted(set(prior_opinions)),
+        external=sorted(set(external)),
+    )
+
+
+def _extract_government_code(text: str) -> list[str]:
+    """Extract Government Code section citations."""
+
+    patterns = [
+        # "Section 87100", "Sections 87100 and 87103"
+        r'[Ss]ections?\s+(\d{5}(?:\([a-z]\))?(?:\(\d+\))?)',
+
+        # "Government Code section 87100"
+        r'Government\s+Code\s+[Ss]ections?\s+(\d{5}(?:\([a-z]\))?(?:\(\d+\))?)',
+
+        # "Gov. Code § 87100", "Gov. Code, § 87100"
+        r'Gov(?:\.|ernment)\s+Code,?\s*§+\s*(\d{5}(?:\([a-z]\))?(?:\(\d+\))?)',
+
+        # "§ 87100" after "Government Code" context
+        r'§+\s*(\d{5}(?:\([a-z]\))?)',
+    ]
+
+    citations = []
+    for pattern in patterns:
+        matches = re.findall(pattern, text, re.IGNORECASE)
+        citations.extend(matches)
+
+    # Filter to valid Political Reform Act sections (81000-91014)
+    valid = []
+    for cite in citations:
+        try:
+            base_num = int(re.match(r'(\d+)', cite).group(1))
+            if 81000 <= base_num <= 92000:
+                valid.append(cite)
+        except (ValueError, AttributeError):
+            continue
+
+    return valid
+
+
+def _extract_regulations(text: str) -> list[str]:
+    """Extract FPPC Regulation citations."""
+
+    patterns = [
+        # "Regulation 18700"
+        r'[Rr]egulations?\s+(\d{5}(?:\.\d+)?)',
+
+        # "2 Cal. Code Regs. § 18700"
+        r'2\s+Cal\.?\s+Code\s+(?:of\s+)?Regs?\.?\s*§?\s*(\d{5}(?:\.\d+)?)',
+
+        # "FPPC Regulation 18700"
+        r'FPPC\s+[Rr]egulations?\s+(\d{5}(?:\.\d+)?)',
+
+        # "Cal. Code Regs., tit. 2, § 18700"
+        r'tit\.?\s*2,?\s*§?\s*(\d{5}(?:\.\d+)?)',
+
+        # "Section 18700" in regulation context
+        r'[Ss]ection\s+(\d{5}(?:\.\d+)?)\s+of\s+(?:the\s+)?(?:FPPC\s+)?[Rr]egulations?',
+    ]
+
+    citations = []
+    for pattern in patterns:
+        matches = re.findall(pattern, text)
+        citations.extend(matches)
+
+    # FPPC regulations are in 18000-18999 range
+    valid = []
+    for cite in citations:
+        try:
+            base_num = int(re.match(r'(\d+)', cite).group(1))
+            if 18000 <= base_num <= 19000:
+                valid.append(cite)
+        except (ValueError, AttributeError):
+            continue
+
+    return valid
+
+
+def _extract_prior_opinions(text: str) -> list[str]:
+    """Extract references to prior FPPC advice letters and opinions."""
+
+    patterns = [
+        # Modern format: "A-24-006", "I-23-177", "M-00-033"
+        r'\b([AIM]-\d{2}-\d{3})\b',
+
+        # With "No." prefix: "No. A-24-006"
+        r'No\.?\s*([AIM]-\d{2}-\d{3})',
+
+        # Older format: "Advice Letter No. 24006"
+        r'[Aa]dvice\s+[Ll]etter\s+(?:No\.?\s*)?(\d{5})',
+
+        # "In re Smith, A-22-001"
+        r'In\s+re\s+\w+,?\s+([AIM]-\d{2}-\d{3})',
+
+        # Older opinion format: "Opinion No. 82-032"
+        r'[Oo]pinion\s+(?:No\.?\s*)?(\d{2}-\d{3})',
+
+        # File number format: "Our File No. A-24-006"
+        r'(?:Our\s+)?File\s+No\.?\s*([AIM]-\d{2}-\d{3})',
+    ]
+
+    citations = []
+    for pattern in patterns:
+        matches = re.findall(pattern, text)
+        citations.extend(matches)
+
+    return citations
+
+
+def _extract_external_citations(text: str) -> list[str]:
+    """Extract court case and other external citations."""
+
+    citations = []
+
+    # California case citations: "123 Cal.App.4th 456"
+    ca_pattern = r'\d+\s+Cal\.?\s*(?:App\.?\s*)?(?:2d|3d|4th|5th)?\s+\d+'
+    citations.extend(re.findall(ca_pattern, text))
+
+    # Federal case citations
+    fed_pattern = r'\d+\s+(?:U\.S\.|F\.2d|F\.3d|F\.\s*Supp\.?)\s+\d+'
+    citations.extend(re.findall(fed_pattern, text))
+
+    # FPPC formal opinions: "In re Doe (1975) 1 FPPC Ops. 71"
+    fppc_ops = r'In\s+re\s+\w+\s*\(\d{4}\)\s*\d+\s+FPPC\s+Ops\.?\s+\d+'
+    citations.extend(re.findall(fppc_ops, text))
+
+    return citations
+```
+
+---
+
+## Task 3.5: Topic Classifier
+
+**File**: `scraper/classifier.py`
+
+```python
+# scraper/classifier.py
+
+"""
+Heuristic topic classification based on cited code sections.
+
+Government Code section ranges by topic:
+- Conflicts of Interest: §§ 87100-87500
+- Campaign Finance: §§ 84100-85800
+- Lobbying: §§ 86100-86400
+"""
+
+from dataclasses import dataclass
+from typing import Literal
+
+TopicType = Literal["conflicts_of_interest", "campaign_finance", "lobbying", "other"]
+
+@dataclass
+class ClassificationResult:
+    """Topic classification result."""
+    topic_primary: TopicType | None
+    confidence: float
+    method: str
+    section_counts: dict[str, int]
+
+
+# Section ranges by topic
+TOPIC_RANGES = {
+    "conflicts_of_interest": [
+        range(87100, 87600),  # General conflicts
+        range(87200, 87220),  # Economic disclosure
+        range(87300, 87315),  # Designated employees
+    ],
+    "campaign_finance": [
+        range(84100, 84600),  # Campaign reporting
+        range(85100, 85800),  # Contributions/expenditures
+        range(89500, 89600),  # Mass mailing
+    ],
+    "lobbying": [
+        range(86100, 86400),  # Lobbyist registration
+    ],
+}
+
+
+def classify_by_citations(government_code_citations: list[str]) -> ClassificationResult:
+    """
+    Classify document topic based on Government Code citations.
+    """
+    if not government_code_citations:
+        return ClassificationResult(
+            topic_primary=None,
+            confidence=0.0,
+            method="heuristic:no_citations",
+            section_counts={}
+        )
+
+    # Count citations by topic
+    counts = {"conflicts_of_interest": 0, "campaign_finance": 0, "lobbying": 0}
+
+    for cite in government_code_citations:
+        try:
+            base_num = int(cite.split('(')[0])
+        except ValueError:
+            continue
+
+        for topic, ranges in TOPIC_RANGES.items():
+            for r in ranges:
+                if base_num in r:
+                    counts[topic] += 1
+                    break
+
+    total = sum(counts.values())
+
+    if total == 0:
+        return ClassificationResult(
+            topic_primary="other",
+            confidence=0.5,
+            method="heuristic:unknown_sections",
+            section_counts=counts
+        )
+
+    # Find winner
+    max_topic = max(counts, key=counts.get)
+    max_count = counts[max_topic]
+
+    if max_count == 0:
+        topic = "other"
+        confidence = 0.5
+    else:
+        topic = max_topic
+        confidence = max_count / total
+
+    return ClassificationResult(
+        topic_primary=topic,
+        confidence=round(confidence, 2),
+        method="heuristic:citation_based",
+        section_counts=counts
+    )
+```
+
+---
+
+## Task 3.6: Database Updates
+
+**File**: Update `scraper/db.py`
+
+```python
+# Add to scraper/db.py
+
+def add_extraction_columns():
+    """Add extraction tracking columns to documents table."""
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    new_columns = [
+        ("extraction_status", "TEXT DEFAULT 'pending'"),
+        ("extracted_at", "TEXT"),
+        ("extraction_method", "TEXT"),
+        ("extraction_quality", "REAL"),
+        ("section_confidence", "REAL"),
+        ("json_path", "TEXT"),
+        ("needs_llm_extraction", "INTEGER DEFAULT 0"),
+        ("llm_extracted_at", "TEXT"),
+    ]
+
+    for col_name, col_def in new_columns:
+        try:
+            cursor.execute(f"ALTER TABLE documents ADD COLUMN {col_name} {col_def}")
+        except Exception:
+            pass  # Column already exists
+
+    conn.commit()
+    conn.close()
+
+
+def get_pending_extractions(year: int = None, limit: int = None) -> list:
+    """Get documents that need extraction."""
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    sql = """
+        SELECT * FROM documents
+        WHERE download_status = 'downloaded'
+        AND (extraction_status = 'pending' OR extraction_status IS NULL)
+    """
+    if year:
+        sql += f" AND year_tag = {year}"
+    sql += " ORDER BY year_tag DESC, id"
+    if limit:
+        sql += f" LIMIT {limit}"
+
+    cursor.execute(sql)
+    results = cursor.fetchall()
+    conn.close()
+    return results
+
+
+def get_documents_needing_llm(limit: int = None) -> list:
+    """Get documents flagged for LLM extraction."""
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    sql = """
+        SELECT * FROM documents
+        WHERE extraction_status = 'extracted'
+        AND needs_llm_extraction = 1
+        AND llm_extracted_at IS NULL
+        ORDER BY year_tag DESC
+    """
+    if limit:
+        sql += f" LIMIT {limit}"
+
+    cursor.execute(sql)
+    results = cursor.fetchall()
+    conn.close()
+    return results
+
+
+def update_extraction_status(doc_id: int, status: str, method: str = None,
+                            quality: float = None, section_confidence: float = None,
+                            json_path: str = None, needs_llm: bool = False):
+    """Update extraction status for a document."""
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        UPDATE documents
+        SET extraction_status = ?,
+            extracted_at = datetime('now'),
+            extraction_method = COALESCE(?, extraction_method),
+            extraction_quality = COALESCE(?, extraction_quality),
+            section_confidence = COALESCE(?, section_confidence),
+            json_path = COALESCE(?, json_path),
+            needs_llm_extraction = ?
+        WHERE id = ?
+    """, (status, method, quality, section_confidence, json_path,
+          1 if needs_llm else 0, doc_id))
+
+    conn.commit()
+    conn.close()
+```
+
+---
+
+## Task 3.7: Core Extractor (Phase 3A)
+
+**File**: `scraper/extractor.py`
 
 ```python
 # scraper/extractor.py
 
 """
-Core extraction module for FPPC documents.
+Core extraction pipeline for FPPC documents.
+
+Phase 3A: Conservative extraction using native text + regex parsing.
+Does NOT use LLM - that's Phase 3B (llm_extractor.py).
 
 Usage:
     python -m scraper.extractor --extract-all
     python -m scraper.extractor --extract-year 2024
-    python -m scraper.extractor --extract-pending
+    python -m scraper.extractor --extract-sample 50
     python -m scraper.extractor --stats
 """
 
 import os
 import json
-import base64
-import time
+import hashlib
 from pathlib import Path
 from datetime import datetime
 from dataclasses import asdict
 
 import pymupdf
-from openai import OpenAI
 from dotenv import load_dotenv
 
-from .config import RAW_PDFS_DIR, DATA_DIR, HEADERS
-from .db import get_connection
-from .schema import FPPCDocument, ExtractionInfo, Content, ...
+from .config import RAW_PDFS_DIR, DATA_DIR
+from .db import (get_connection, get_pending_extractions,
+                 update_extraction_status, add_extraction_columns)
+from .schema import (FPPCDocument, SourceMetadata, ExtractionInfo, Content,
+                     ParsedMetadata, Sections, Citations, Classification,
+                     EmbeddingContent)
+from .quality import compute_quality_score, should_use_olmocr
 from .section_parser import parse_sections
 from .citation_extractor import extract_citations
-from .quality import compute_quality_score
+from .classifier import classify_by_citations
 
 load_dotenv()
 
-DEEPINFRA_API_KEY = os.getenv("DEEPINFRA_API_KEY")
-OLMOCR_MODEL = "allenai/olmOCR-2-7B-1025"
 EXTRACTED_DIR = DATA_DIR / "extracted"
 
 
 class Extractor:
-    def __init__(self):
-        self.client = None
-        if DEEPINFRA_API_KEY:
-            self.client = OpenAI(
-                api_key=DEEPINFRA_API_KEY,
-                base_url="https://api.deepinfra.com/v1/openai",
-            )
+    """Core extraction pipeline."""
+
+    def __init__(self, use_olmocr: bool = True):
+        self.use_olmocr = use_olmocr
+        self.olmocr_client = None
+
+        if use_olmocr:
+            api_key = os.getenv("DEEPINFRA_API_KEY")
+            if api_key:
+                from openai import OpenAI
+                self.olmocr_client = OpenAI(
+                    api_key=api_key,
+                    base_url="https://api.deepinfra.com/v1/openai",
+                )
 
     def extract_native(self, pdf_path: Path) -> dict:
         """Extract text using PyMuPDF native extraction."""
@@ -337,10 +1170,12 @@ class Extractor:
             "char_count": len(text),
         }
 
-    def extract_olmocr(self, pdf_path: Path, max_pages: int = 50) -> dict:
+    def extract_olmocr(self, pdf_path: Path, max_pages: int = 50) -> dict | None:
         """Extract text using olmOCR via DeepInfra API."""
-        if not self.client:
-            raise ValueError("DeepInfra API key not configured")
+        if not self.olmocr_client:
+            return None
+
+        import base64
 
         doc = pymupdf.open(pdf_path)
         pages_to_process = min(len(doc), max_pages)
@@ -350,7 +1185,6 @@ class Extractor:
         total_tokens = 0
 
         for page_num in range(pages_to_process):
-            # Convert page to image
             page = doc[page_num]
             zoom = 150 / 72  # 150 DPI
             mat = pymupdf.Matrix(zoom, zoom)
@@ -358,30 +1192,34 @@ class Extractor:
             img_bytes = pix.tobytes("png")
             base64_image = base64.b64encode(img_bytes).decode()
 
-            # Call olmOCR
-            response = self.client.chat.completions.create(
-                model=OLMOCR_MODEL,
-                max_tokens=4096,
-                messages=[{
-                    "role": "user",
-                    "content": [{
-                        "type": "image_url",
-                        "image_url": {"url": f"data:image/png;base64,{base64_image}"}
+            try:
+                response = self.olmocr_client.chat.completions.create(
+                    model="allenai/olmOCR-2-7B-1025",
+                    max_tokens=4096,
+                    messages=[{
+                        "role": "user",
+                        "content": [{
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/png;base64,{base64_image}"}
+                        }]
                     }]
-                }]
-            )
+                )
 
-            page_text = response.choices[0].message.content
-            all_markdown.append(f"<!-- Page {page_num + 1} -->\n{page_text}")
+                page_text = response.choices[0].message.content
+                all_markdown.append(f"<!-- Page {page_num + 1} -->\n{page_text}")
+                all_text.append(self._markdown_to_plain(page_text))
 
-            # Strip markdown for plain text version
-            plain_text = self._markdown_to_plain(page_text)
-            all_text.append(plain_text)
+                if response.usage:
+                    total_tokens += response.usage.total_tokens
 
-            if response.usage:
-                total_tokens += response.usage.total_tokens
+            except Exception as e:
+                print(f"  olmOCR error on page {page_num + 1}: {e}")
+                continue
 
         doc.close()
+
+        if not all_text:
+            return None
 
         text = "\n\n".join(all_text)
         markdown = "\n\n".join(all_markdown)
@@ -398,32 +1236,39 @@ class Extractor:
         }
 
     def _markdown_to_plain(self, md: str) -> str:
-        """Convert markdown to plain text (simple version)."""
+        """Convert markdown to plain text."""
         import re
         text = md
-        text = re.sub(r'\*\*(.+?)\*\*', r'\1', text)  # Bold
-        text = re.sub(r'\*(.+?)\*', r'\1', text)      # Italic
-        text = re.sub(r'^#+\s+', '', text, flags=re.MULTILINE)  # Headers
-        text = re.sub(r'^\s*[-*+]\s+', '', text, flags=re.MULTILINE)  # Lists
+        text = re.sub(r'\*\*(.+?)\*\*', r'\1', text)
+        text = re.sub(r'\*(.+?)\*', r'\1', text)
+        text = re.sub(r'^#+\s+', '', text, flags=re.MULTILINE)
+        text = re.sub(r'^\s*[-*+]\s+', '', text, flags=re.MULTILINE)
         return text
 
     def process_document(self, doc_record) -> FPPCDocument:
-        """Process a single document through the full pipeline."""
+        """Process a single document through the extraction pipeline."""
 
-        # Find the PDF file
+        # Find PDF file
         pdf_path = self._find_pdf(doc_record)
         if not pdf_path:
-            raise FileNotFoundError(f"PDF not found for {doc_record.id}")
+            raise FileNotFoundError(f"PDF not found for {doc_record}")
 
-        # Step 1: Try native extraction
+        # Compute SHA256
+        with open(pdf_path, 'rb') as f:
+            pdf_sha256 = hashlib.sha256(f.read()).hexdigest()
+
+        # Step 1: Native extraction
         native_result = self.extract_native(pdf_path)
 
-        # Step 2: Decide if we need olmOCR
-        use_olmocr = should_use_olmocr(doc_record, native_result)
+        # Step 2: Quality assessment
+        quality = compute_quality_score(
+            native_result["text"],
+            native_result["page_count"]
+        )
 
-        # Step 3: Run olmOCR if needed
+        # Step 3: olmOCR if needed
         olmocr_result = None
-        if use_olmocr and self.client:
+        if self.use_olmocr and should_use_olmocr(doc_record.year_tag, quality):
             olmocr_result = self.extract_olmocr(pdf_path)
 
         # Step 4: Choose best result
@@ -431,45 +1276,48 @@ class Extractor:
             primary_text = olmocr_result["text"]
             markdown_text = olmocr_result["markdown"]
             method = "olmocr"
-            word_count = olmocr_result["word_count"]
             olmocr_cost = olmocr_result["cost"]
         else:
             primary_text = native_result["text"]
             markdown_text = None
-            method = "native" if not use_olmocr else "native+olmocr"
-            word_count = native_result["word_count"]
+            method = "native"
             olmocr_cost = olmocr_result["cost"] if olmocr_result else None
 
         # Step 5: Parse sections
-        sections = parse_sections(primary_text)
+        sections_result = parse_sections(primary_text, doc_record.year_tag)
 
         # Step 6: Extract citations
-        citations = extract_citations(primary_text)
+        citations_result = extract_citations(primary_text)
 
-        # Step 7: Compute quality score
-        quality_score = compute_quality_score(primary_text, native_result["page_count"])
+        # Step 7: Classify by citations
+        classification_result = classify_by_citations(citations_result.government_code)
 
         # Step 8: Parse metadata from text
         parsed_meta = self._parse_metadata(primary_text, doc_record)
 
-        # Step 9: Heuristic classification (based on citations)
-        classification = self._classify_by_citations(citations)
+        # Step 9: Build embedding content
+        embedding = self._build_embedding_content(sections_result, primary_text)
 
-        # Build the document
+        # Step 10: Build document
         return FPPCDocument(
             id=doc_record.letter_id or self._generate_id(doc_record),
             year=doc_record.year_tag,
             pdf_url=doc_record.pdf_url,
-            pdf_sha256=doc_record.pdf_sha256,
+            pdf_sha256=pdf_sha256,
             local_pdf_path=str(pdf_path.relative_to(Path.cwd())),
-            source_metadata=SourceMetadata(...),
+            source_metadata=SourceMetadata(
+                title_raw=doc_record.title or "",
+                tags=doc_record.tags.split(",") if doc_record.tags else [],
+                scraped_at=doc_record.scraped_at or "",
+                source_page_url=None,
+            ),
             extraction=ExtractionInfo(
                 method=method,
                 extracted_at=datetime.now().isoformat(),
                 page_count=native_result["page_count"],
-                word_count=word_count,
+                word_count=len(primary_text.split()),
                 char_count=len(primary_text),
-                quality_score=quality_score,
+                quality_score=quality.final_score,
                 olmocr_cost=olmocr_cost,
                 native_word_count=native_result["word_count"],
             ),
@@ -478,17 +1326,39 @@ class Extractor:
                 full_text_markdown=markdown_text,
             ),
             parsed=parsed_meta,
-            sections=sections,
-            citations=citations,
-            classification=classification,
-            generated=Generated(...),  # All null for now
+            sections=Sections(
+                question=sections_result.question,
+                conclusion=sections_result.conclusion,
+                facts=sections_result.facts,
+                analysis=sections_result.analysis,
+                question_synthetic=None,  # Populated in Phase 3B
+                conclusion_synthetic=None,
+                extraction_method=sections_result.extraction_method,
+                extraction_confidence=sections_result.extraction_confidence,
+                has_standard_format=sections_result.has_standard_format,
+                parsing_notes=sections_result.parsing_notes,
+            ),
+            citations=Citations(
+                government_code=citations_result.government_code,
+                regulations=citations_result.regulations,
+                prior_opinions=citations_result.prior_opinions,
+                cited_by=[],  # Populated in post-processing
+                external=citations_result.external,
+            ),
+            classification=Classification(
+                topic_primary=classification_result.topic_primary,
+                topic_secondary=None,
+                topic_tags=[],
+                confidence=classification_result.confidence,
+                classified_at=datetime.now().isoformat(),
+                classification_method=classification_result.method,
+            ),
+            embedding=embedding,
         )
 
     def _find_pdf(self, doc_record) -> Path | None:
         """Find the local PDF file for a document record."""
-        # PDFs are stored as raw_pdfs/{year}/{filename}
         year = doc_record.year_tag
-        # Extract filename from URL
         filename = doc_record.pdf_url.split("/")[-1]
 
         path = RAW_PDFS_DIR / str(year) / filename
@@ -504,56 +1374,302 @@ class Extractor:
 
         return None
 
-    def save_document(self, doc: FPPCDocument):
+    def _generate_id(self, doc_record) -> str:
+        """Generate an ID if letter_id is missing."""
+        return f"UNK-{doc_record.year_tag}-{doc_record.id}"
+
+    def _parse_metadata(self, text: str, doc_record) -> ParsedMetadata:
+        """Parse metadata from document text."""
+        import re
+
+        # Extract date
+        date_match = re.search(
+            r'(January|February|March|April|May|June|July|August|'
+            r'September|October|November|December)\s+(\d{1,2}),?\s+(\d{4})',
+            text
+        )
+        date_raw = date_match.group(0) if date_match else None
+        date_iso = None
+        if date_match:
+            try:
+                from datetime import datetime as dt
+                parsed = dt.strptime(date_raw.replace(",", ""), "%B %d %Y")
+                date_iso = parsed.strftime("%Y-%m-%d")
+            except:
+                pass
+
+        # Determine document type
+        doc_type = "advice_letter"  # Default
+        if re.search(r'informal\s+advice', text, re.I):
+            doc_type = "informal_advice"
+        elif re.search(r'\bopinion\b', text[:500], re.I):
+            doc_type = "opinion"
+        elif not re.search(r'FPPC|Fair Political|Political Reform', text, re.I):
+            doc_type = "unknown"
+
+        return ParsedMetadata(
+            date=date_iso,
+            date_raw=date_raw,
+            requestor_name=None,  # Could parse from salutation
+            requestor_title=None,
+            requestor_city=None,
+            document_type=doc_type,
+        )
+
+    def _build_embedding_content(self, sections, full_text: str) -> EmbeddingContent:
+        """Build content optimized for embedding generation."""
+
+        # Q+A text (prefer extracted, fall back to synthetic later)
+        qa_parts = []
+        qa_source = "extracted"
+
+        if sections.question:
+            qa_parts.append(f"QUESTION: {sections.question}")
+        if sections.conclusion:
+            qa_parts.append(f"CONCLUSION: {sections.conclusion}")
+
+        if not qa_parts:
+            qa_source = "synthetic"  # Will be filled by LLM later
+
+        qa_text = "\n\n".join(qa_parts) if qa_parts else ""
+
+        # First 500 words
+        words = full_text.split()
+        first_500 = " ".join(words[:500])
+
+        return EmbeddingContent(
+            qa_text=qa_text,
+            qa_source=qa_source,
+            first_500_words=first_500,
+            summary=None,
+        )
+
+    def save_document(self, doc: FPPCDocument) -> Path:
         """Save extracted document to JSON file."""
         year_dir = EXTRACTED_DIR / str(doc.year)
         year_dir.mkdir(parents=True, exist_ok=True)
 
-        filename = f"{doc.id}.json"
+        # Sanitize ID for filename
+        safe_id = doc.id.replace("/", "-").replace("\\", "-")
+        filename = f"{safe_id}.json"
         filepath = year_dir / filename
 
         with open(filepath, "w", encoding="utf-8") as f:
             json.dump(asdict(doc), f, indent=2, ensure_ascii=False)
 
         return filepath
-```
 
-### CLI Interface
 
-```python
-# At the bottom of scraper/extractor.py
+def extract_sample(n: int = 50, output_dir: str = None):
+    """
+    Extract a representative sample for review.
+
+    Samples across eras:
+    - 10 docs from 1975-1985
+    - 10 docs from 1986-1995
+    - 10 docs from 1996-2005
+    - 10 docs from 2006-2015
+    - 10 docs from 2016-2025
+    """
+    from collections import defaultdict
+
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    # Get documents by era
+    eras = [
+        (1975, 1985),
+        (1986, 1995),
+        (1996, 2005),
+        (2006, 2015),
+        (2016, 2025),
+    ]
+
+    samples = []
+    per_era = n // len(eras)
+
+    for start, end in eras:
+        cursor.execute("""
+            SELECT * FROM documents
+            WHERE download_status = 'downloaded'
+            AND year_tag >= ? AND year_tag <= ?
+            ORDER BY RANDOM()
+            LIMIT ?
+        """, (start, end, per_era))
+        samples.extend(cursor.fetchall())
+
+    conn.close()
+
+    print(f"Extracting {len(samples)} sample documents...")
+
+    extractor = Extractor(use_olmocr=False)  # Skip olmOCR for quick sample
+    results = []
+
+    for i, doc_record in enumerate(samples):
+        print(f"  [{i+1}/{len(samples)}] {doc_record.year_tag}: {doc_record.pdf_url.split('/')[-1]}")
+        try:
+            doc = extractor.process_document(doc_record)
+            filepath = extractor.save_document(doc)
+            results.append({
+                "id": doc.id,
+                "year": doc.year,
+                "quality": doc.extraction.quality_score,
+                "section_confidence": doc.sections.extraction_confidence,
+                "has_question": bool(doc.sections.question),
+                "has_conclusion": bool(doc.sections.conclusion),
+                "filepath": str(filepath),
+            })
+        except Exception as e:
+            print(f"    ERROR: {e}")
+            results.append({
+                "id": doc_record.letter_id,
+                "year": doc_record.year_tag,
+                "error": str(e),
+            })
+
+    # Save summary
+    summary_path = EXTRACTED_DIR / "sample_summary.json"
+    with open(summary_path, "w") as f:
+        json.dump(results, f, indent=2)
+
+    # Print summary
+    success = [r for r in results if "error" not in r]
+    has_q = sum(1 for r in success if r.get("has_question"))
+    has_c = sum(1 for r in success if r.get("has_conclusion"))
+    avg_quality = sum(r.get("quality", 0) for r in success) / len(success) if success else 0
+    avg_confidence = sum(r.get("section_confidence", 0) for r in success) / len(success) if success else 0
+
+    print(f"\n{'='*50}")
+    print(f"Sample Extraction Summary")
+    print(f"{'='*50}")
+    print(f"Total: {len(samples)}, Success: {len(success)}, Errors: {len(results) - len(success)}")
+    print(f"Has QUESTION: {has_q}/{len(success)} ({100*has_q/len(success):.1f}%)")
+    print(f"Has CONCLUSION: {has_c}/{len(success)} ({100*has_c/len(success):.1f}%)")
+    print(f"Avg quality score: {avg_quality:.2f}")
+    print(f"Avg section confidence: {avg_confidence:.2f}")
+    print(f"\nReview files in: {EXTRACTED_DIR}")
+    print(f"Summary saved to: {summary_path}")
+
+
+def extract_all(dry_run: bool = False, skip_olmocr: bool = False):
+    """Extract all pending documents."""
+    add_extraction_columns()
+
+    docs = get_pending_extractions()
+    print(f"Found {len(docs)} documents to extract")
+
+    if dry_run:
+        print("Dry run - not extracting")
+        return
+
+    extractor = Extractor(use_olmocr=not skip_olmocr)
+
+    for i, doc_record in enumerate(docs):
+        print(f"[{i+1}/{len(docs)}] {doc_record.year_tag}: {doc_record.pdf_url.split('/')[-1]}")
+
+        try:
+            doc = extractor.process_document(doc_record)
+            filepath = extractor.save_document(doc)
+
+            # Flag for LLM extraction if needed
+            needs_llm = (
+                doc.sections.extraction_confidence < 0.7 or
+                not doc.sections.has_standard_format
+            )
+
+            update_extraction_status(
+                doc_id=doc_record.id,
+                status="extracted",
+                method=doc.extraction.method,
+                quality=doc.extraction.quality_score,
+                section_confidence=doc.sections.extraction_confidence,
+                json_path=str(filepath),
+                needs_llm=needs_llm,
+            )
+
+            print(f"  ✓ quality={doc.extraction.quality_score:.2f}, "
+                  f"sections={doc.sections.extraction_confidence:.2f}, "
+                  f"llm_needed={needs_llm}")
+
+        except Exception as e:
+            print(f"  ✗ ERROR: {e}")
+            update_extraction_status(doc_record.id, "error")
+
+
+def show_stats():
+    """Show extraction statistics."""
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT
+            extraction_status,
+            COUNT(*) as count,
+            AVG(extraction_quality) as avg_quality,
+            AVG(section_confidence) as avg_confidence,
+            SUM(needs_llm_extraction) as needs_llm
+        FROM documents
+        WHERE download_status = 'downloaded'
+        GROUP BY extraction_status
+    """)
+
+    print("\nExtraction Status:")
+    print("-" * 60)
+    for row in cursor.fetchall():
+        print(f"  {row[0] or 'pending':12} {row[1]:>6} docs  "
+              f"quality={row[2] or 0:.2f}  confidence={row[3] or 0:.2f}  "
+              f"needs_llm={row[4] or 0}")
+
+    cursor.execute("""
+        SELECT year_tag, COUNT(*), AVG(extraction_quality), AVG(section_confidence)
+        FROM documents
+        WHERE extraction_status = 'extracted'
+        GROUP BY year_tag
+        ORDER BY year_tag DESC
+        LIMIT 10
+    """)
+
+    print("\nBy Year (recent):")
+    print("-" * 60)
+    for row in cursor.fetchall():
+        print(f"  {row[0]}: {row[1]:>4} docs  quality={row[2]:.2f}  confidence={row[3]:.2f}")
+
+    conn.close()
+
 
 def main():
     import argparse
 
-    parser = argparse.ArgumentParser(description="FPPC Document Extractor")
+    parser = argparse.ArgumentParser(description="FPPC Document Extractor (Phase 3A)")
     parser.add_argument("--extract-all", action="store_true",
                         help="Extract all pending documents")
     parser.add_argument("--extract-year", type=int,
                         help="Extract documents from specific year")
-    parser.add_argument("--extract-one", type=int,
-                        help="Extract single document by DB id")
+    parser.add_argument("--extract-sample", type=int, default=50,
+                        help="Extract N sample documents for review")
     parser.add_argument("--stats", action="store_true",
                         help="Show extraction statistics")
     parser.add_argument("--dry-run", action="store_true",
-                        help="Show what would be extracted without doing it")
-    parser.add_argument("--force-olmocr", action="store_true",
-                        help="Force olmOCR even if native succeeds")
+                        help="Show what would be extracted")
     parser.add_argument("--skip-olmocr", action="store_true",
-                        help="Skip olmOCR entirely (native only)")
+                        help="Skip olmOCR (native only)")
+    parser.add_argument("--init", action="store_true",
+                        help="Initialize extraction columns in DB")
 
     args = parser.parse_args()
 
-    extractor = Extractor()
-
-    if args.stats:
-        show_extraction_stats()
+    if args.init:
+        add_extraction_columns()
+        print("Extraction columns initialized")
+    elif args.stats:
+        show_stats()
+    elif args.extract_sample:
+        extract_sample(args.extract_sample)
     elif args.extract_all:
-        extract_all(extractor, dry_run=args.dry_run)
+        extract_all(dry_run=args.dry_run, skip_olmocr=args.skip_olmocr)
     elif args.extract_year:
-        extract_year(extractor, args.extract_year, dry_run=args.dry_run)
-    elif args.extract_one:
-        extract_one(extractor, args.extract_one)
+        # TODO: implement year-specific extraction
+        print(f"Would extract year {args.extract_year}")
     else:
         parser.print_help()
 
@@ -564,661 +1680,427 @@ if __name__ == "__main__":
 
 ---
 
-## Phase 3B: Section Parser
+## Task 3.9: LLM Extractor (Phase 3B)
 
-### Section Patterns
-
-FPPC advice letters follow several formats across different eras:
-
-**Modern Format (2010+)**:
-```
-QUESTION
-[question text]
-
-CONCLUSION
-[conclusion text]
-
-FACTS
-[facts text]
-
-ANALYSIS
-[analysis text]
-```
-
-**Older Format (1990s-2000s)**:
-```
-QUESTION PRESENTED
-[question text]
-
-SHORT ANSWER
-[answer text]
-
-DISCUSSION
-[discussion text]
-```
-
-**Very Old Format (1975-1989)**:
-Often less structured, may just be a letter with paragraphs.
-
-### Implementation
+**File**: `scraper/llm_extractor.py`
 
 ```python
-# scraper/section_parser.py
+# scraper/llm_extractor.py
 
 """
-Parse structured sections from FPPC advice letters.
+LLM-based section extraction for documents without standard format.
+
+Uses Claude Haiku to:
+1. Extract question/conclusion from unstructured text
+2. Generate synthetic Q/A for documents without clear sections
+3. Optionally generate summaries
+
+Usage:
+    python -m scraper.llm_extractor --process-pending
+    python -m scraper.llm_extractor --process-one 12345
+    python -m scraper.llm_extractor --estimate-cost
 """
 
-import re
-from dataclasses import dataclass
-
-@dataclass
-class Sections:
-    question: str | None
-    conclusion: str | None
-    facts: str | None
-    analysis: str | None
-    has_standard_format: bool
-    parsing_notes: str | None
-
-
-# Section header patterns (order matters - more specific first)
-SECTION_PATTERNS = [
-    # Modern format
-    (r'(?:^|\n)\s*QUESTION[S]?\s*(?:\n|:)', 'question'),
-    (r'(?:^|\n)\s*CONCLUSION[S]?\s*(?:\n|:)', 'conclusion'),
-    (r'(?:^|\n)\s*SHORT\s+ANSWER[S]?\s*(?:\n|:)', 'conclusion'),
-    (r'(?:^|\n)\s*FACT[S]?\s*(?:\n|:)', 'facts'),
-    (r'(?:^|\n)\s*ANALYSIS\s*(?:\n|:)', 'analysis'),
-    (r'(?:^|\n)\s*DISCUSSION\s*(?:\n|:)', 'analysis'),
-
-    # Older format variants
-    (r'(?:^|\n)\s*QUESTION\s+PRESENTED\s*(?:\n|:)', 'question'),
-    (r'(?:^|\n)\s*ISSUES?\s+PRESENTED\s*(?:\n|:)', 'question'),
-    (r'(?:^|\n)\s*SUMMARY\s*(?:\n|:)', 'conclusion'),
-]
-
-
-def parse_sections(text: str) -> Sections:
-    """
-    Extract structured sections from document text.
-
-    Returns a Sections object with extracted content for each section,
-    or None if the section wasn't found.
-    """
-
-    # Find all section headers and their positions
-    section_positions = []
-
-    for pattern, section_type in SECTION_PATTERNS:
-        for match in re.finditer(pattern, text, re.IGNORECASE | re.MULTILINE):
-            section_positions.append({
-                'type': section_type,
-                'start': match.end(),  # Start of content (after header)
-                'header_start': match.start(),
-                'header': match.group().strip(),
-            })
-
-    # Sort by position in document
-    section_positions.sort(key=lambda x: x['start'])
-
-    # Remove duplicates (keep first occurrence of each type)
-    seen_types = set()
-    unique_sections = []
-    for sec in section_positions:
-        if sec['type'] not in seen_types:
-            seen_types.add(sec['type'])
-            unique_sections.append(sec)
-
-    # Extract content for each section
-    extracted = {'question': None, 'conclusion': None, 'facts': None, 'analysis': None}
-
-    for i, sec in enumerate(unique_sections):
-        # Find end of this section (start of next section, or end of document)
-        if i + 1 < len(unique_sections):
-            end_pos = unique_sections[i + 1]['header_start']
-        else:
-            # For last section, try to find a reasonable end
-            # (signature, page break, etc.)
-            end_pos = _find_section_end(text, sec['start'])
-
-        content = text[sec['start']:end_pos].strip()
-
-        # Clean up the content
-        content = _clean_section_content(content)
-
-        if content and len(content) > 20:  # Minimum viable content
-            extracted[sec['type']] = content
-
-    # Determine if document has standard format
-    has_standard = bool(extracted['question'] or extracted['conclusion'])
-
-    # Build notes about parsing
-    notes = None
-    if not has_standard:
-        notes = "No standard Q/C sections found; may need LLM extraction"
-    elif extracted['question'] and not extracted['conclusion']:
-        notes = "Question found but no conclusion"
-
-    return Sections(
-        question=extracted['question'],
-        conclusion=extracted['conclusion'],
-        facts=extracted['facts'],
-        analysis=extracted['analysis'],
-        has_standard_format=has_standard,
-        parsing_notes=notes,
-    )
-
-
-def _find_section_end(text: str, start: int) -> int:
-    """Find a reasonable end point for the last section."""
+import os
+import json
+from pathlib import Path
+from datetime import datetime
+from dataclasses import asdict
 
-    # Look for common ending patterns
-    end_patterns = [
-        r'\n\s*Sincerely,',
-        r'\n\s*Very truly yours,',
-        r'\n\s*Respectfully,',
-        r'\n\s*[A-Z][a-z]+\s+[A-Z]\.\s+[A-Z][a-z]+\s*\n',  # Name signature
-        r'\n\s*\*\s*\*\s*\*',  # Asterisk separator
-    ]
+import anthropic
+from dotenv import load_dotenv
 
-    search_text = text[start:]
-    min_end = len(text)
+from .config import DATA_DIR
+from .db import get_connection, get_documents_needing_llm
 
-    for pattern in end_patterns:
-        match = re.search(pattern, search_text)
-        if match:
-            end = start + match.start()
-            min_end = min(min_end, end)
+load_dotenv()
 
-    return min_end
+EXTRACTED_DIR = DATA_DIR / "extracted"
 
+# Claude Haiku pricing (as of 2024)
+HAIKU_INPUT_COST = 0.25 / 1_000_000   # $0.25 per million input tokens
+HAIKU_OUTPUT_COST = 1.25 / 1_000_000  # $1.25 per million output tokens
 
-def _clean_section_content(content: str) -> str:
-    """Clean up extracted section content."""
 
-    # Remove excessive whitespace
-    content = re.sub(r'\n{3,}', '\n\n', content)
-    content = re.sub(r'[ \t]+', ' ', content)
+EXTRACTION_PROMPT = """You are analyzing an FPPC (California Fair Political Practices Commission) advice letter. Your task is to extract or synthesize the legal question and conclusion.
 
-    # Remove page numbers and headers that might have been captured
-    content = re.sub(r'\n\s*-?\s*\d+\s*-?\s*\n', '\n', content)  # Page numbers
-    content = re.sub(r'\n\s*Page\s+\d+\s*\n', '\n', content, flags=re.IGNORECASE)
+<document>
+{text}
+</document>
 
-    return content.strip()
-```
+Instructions:
+1. Look for explicit QUESTION/CONCLUSION sections. If found, extract them verbatim.
+2. If no explicit sections exist, synthesize them from the document content:
+   - question_synthetic: A clear, one-sentence statement of the legal question addressed
+   - conclusion_synthetic: A clear summary of the FPPC's answer/position
 
----
+Return ONLY valid JSON (no markdown, no explanation):
+{{
+  "question_extracted": "..." or null,
+  "conclusion_extracted": "..." or null,
+  "question_synthetic": "...",
+  "conclusion_synthetic": "...",
+  "document_type": "advice_letter" | "correspondence" | "other",
+  "confidence": 0.0-1.0,
+  "notes": "..." or null
+}}"""
 
-## Phase 3C: Citation Extractor
 
-### Citation Patterns
+class LLMExtractor:
+    """LLM-based extraction using Claude Haiku."""
 
-FPPC documents cite:
-1. **Government Code** sections (e.g., "Section 87100", "Government Code section 87103(a)")
-2. **FPPC Regulations** (e.g., "Regulation 18700", "2 Cal. Code Regs. § 18702.1")
-3. **Prior Advice Letters** (e.g., "Advice Letter A-23-001", "In re Doe, I-22-015")
+    def __init__(self):
+        api_key = os.getenv("ANTHROPIC_API_KEY")
+        if not api_key:
+            raise ValueError("ANTHROPIC_API_KEY not set in environment")
+        self.client = anthropic.Anthropic(api_key=api_key)
+        self.total_input_tokens = 0
+        self.total_output_tokens = 0
 
-### Implementation
+    def extract_sections(self, text: str, max_chars: int = 15000) -> dict:
+        """Extract/synthesize sections using Claude Haiku."""
 
-```python
-# scraper/citation_extractor.py
+        # Truncate if needed (save tokens)
+        if len(text) > max_chars:
+            text = text[:max_chars] + "\n\n[... truncated ...]"
 
-"""
-Extract legal citations from FPPC advice letters.
-"""
+        prompt = EXTRACTION_PROMPT.format(text=text)
 
-import re
-from dataclasses import dataclass
+        response = self.client.messages.create(
+            model="claude-3-haiku-20240307",
+            max_tokens=1000,
+            messages=[{"role": "user", "content": prompt}]
+        )
 
-@dataclass
-class Citations:
-    government_code: list[str]
-    regulations: list[str]
-    prior_opinions: list[str]
-    external: list[str]
+        # Track token usage
+        self.total_input_tokens += response.usage.input_tokens
+        self.total_output_tokens += response.usage.output_tokens
 
-
-def extract_citations(text: str) -> Citations:
-    """Extract all legal citations from document text."""
-
-    gov_code = extract_government_code(text)
-    regulations = extract_regulations(text)
-    prior_opinions = extract_prior_opinions(text)
-    external = extract_external_citations(text)
-
-    return Citations(
-        government_code=sorted(set(gov_code)),
-        regulations=sorted(set(regulations)),
-        prior_opinions=sorted(set(prior_opinions)),
-        external=sorted(set(external)),
-    )
-
-
-def extract_government_code(text: str) -> list[str]:
-    """Extract Government Code section citations."""
-
-    patterns = [
-        # "Section 87100", "Sections 87100 and 87103"
-        r'[Ss]ections?\s+(\d{5}(?:\([a-z]\))?(?:\(\d+\))?)',
-
-        # "Government Code section 87100"
-        r'Government\s+Code\s+[Ss]ections?\s+(\d{5}(?:\([a-z]\))?(?:\(\d+\))?)',
-
-        # "Gov. Code § 87100", "Gov. Code, § 87100"
-        r'Gov(?:\.|ernment)\s+Code,?\s*§+\s*(\d{5}(?:\([a-z]\))?(?:\(\d+\))?)',
-
-        # Just "§ 87100" in context (be careful, could be regulations)
-        r'(?:Code\s+)?§+\s*(\d{5}(?:\([a-z]\))?)',
-    ]
-
-    citations = []
-    for pattern in patterns:
-        matches = re.findall(pattern, text, re.IGNORECASE)
-        citations.extend(matches)
-
-    # Filter to valid FPPC-related code sections
-    # Political Reform Act is primarily sections 81000-91014
-    valid_citations = []
-    for cite in citations:
-        # Extract the base number
-        base_num = int(re.match(r'(\d+)', cite).group(1))
-        if 81000 <= base_num <= 92000:  # Political Reform Act range
-            valid_citations.append(cite)
-
-    return valid_citations
-
-
-def extract_regulations(text: str) -> list[str]:
-    """Extract FPPC Regulation citations."""
-
-    patterns = [
-        # "Regulation 18700"
-        r'[Rr]egulations?\s+(\d{5}(?:\.\d+)?)',
-
-        # "2 Cal. Code Regs. § 18700"
-        r'2\s+Cal\.?\s+Code\s+(?:of\s+)?Regs?\.?\s*§?\s*(\d{5}(?:\.\d+)?)',
-
-        # "FPPC Regulation 18700"
-        r'FPPC\s+[Rr]egulations?\s+(\d{5}(?:\.\d+)?)',
-
-        # "Cal. Code Regs., tit. 2, § 18700"
-        r'tit\.?\s*2,?\s*§?\s*(\d{5}(?:\.\d+)?)',
-    ]
-
-    citations = []
-    for pattern in patterns:
-        matches = re.findall(pattern, text)
-        citations.extend(matches)
-
-    # FPPC regulations are in the 18000 range
-    valid_citations = []
-    for cite in citations:
-        base_num = int(re.match(r'(\d+)', cite).group(1))
-        if 18000 <= base_num <= 19000:
-            valid_citations.append(cite)
-
-    return valid_citations
-
-
-def extract_prior_opinions(text: str) -> list[str]:
-    """Extract references to prior FPPC advice letters and opinions."""
-
-    patterns = [
-        # "A-24-006", "I-23-177", "A-00-033"
-        r'\b([AIM]-\d{2}-\d{3})\b',
-
-        # "Advice Letter No. 24006"
-        r'[Aa]dvice\s+[Ll]etter\s+(?:No\.?\s*)?(\d{5})',
-
-        # "In re Smith, A-22-001"
-        r'In\s+re\s+\w+,?\s+([AIM]-\d{2}-\d{3})',
-
-        # Older format: "Opinion No. 82-032"
-        r'[Oo]pinion\s+(?:No\.?\s*)?(\d{2}-\d{3})',
-    ]
-
-    citations = []
-    for pattern in patterns:
-        matches = re.findall(pattern, text)
-        citations.extend(matches)
-
-    return citations
-
-
-def extract_external_citations(text: str) -> list[str]:
-    """Extract other legal citations (cases, etc.)."""
-
-    citations = []
-
-    # California case citations: "123 Cal.App.4th 456"
-    case_pattern = r'\d+\s+Cal\.?\s*(?:App\.?\s*)?(?:2d|3d|4th|5th)?\s+\d+'
-    cases = re.findall(case_pattern, text)
-    citations.extend(cases)
-
-    # Federal case citations
-    federal_pattern = r'\d+\s+(?:U\.S\.|F\.2d|F\.3d|F\.Supp\.?)\s+\d+'
-    federal = re.findall(federal_pattern, text)
-    citations.extend(federal)
-
-    return citations
-```
-
----
-
-## Quality Scoring
-
-```python
-# scraper/quality.py
-
-"""
-Compute quality scores for extracted text.
-"""
-
-import re
-
-
-def compute_quality_score(text: str, page_count: int) -> float:
-    """
-    Compute a quality score from 0.0 to 1.0 for extracted text.
-
-    Factors:
-    - Word count per page (too low = OCR failure)
-    - Alphabetic character ratio (too low = garbled)
-    - Presence of expected patterns (dates, sections)
-    - Absence of OCR artifacts
-    """
-
-    if not text or page_count == 0:
-        return 0.0
-
-    scores = []
-
-    # 1. Words per page (expect 200-500 for legal docs)
-    word_count = len(text.split())
-    words_per_page = word_count / page_count
-
-    if words_per_page >= 200:
-        scores.append(1.0)
-    elif words_per_page >= 100:
-        scores.append(0.7)
-    elif words_per_page >= 50:
-        scores.append(0.4)
-    else:
-        scores.append(0.1)
-
-    # 2. Alphabetic ratio
-    alpha_chars = sum(1 for c in text if c.isalpha())
-    alpha_ratio = alpha_chars / len(text) if text else 0
-
-    if alpha_ratio >= 0.7:
-        scores.append(1.0)
-    elif alpha_ratio >= 0.5:
-        scores.append(0.6)
-    else:
-        scores.append(0.2)
-
-    # 3. Expected patterns present
-    has_date = bool(re.search(
-        r'(January|February|March|April|May|June|July|August|'
-        r'September|October|November|December)\s+\d{1,2},?\s+\d{4}',
-        text
-    ))
-    has_fppc = bool(re.search(r'FPPC|Fair Political|Political Practices', text, re.I))
-    has_section = bool(re.search(r'\b(QUESTION|CONCLUSION|ANALYSIS)\b', text, re.I))
-
-    pattern_score = (int(has_date) + int(has_fppc) + int(has_section)) / 3
-    scores.append(pattern_score)
-
-    # 4. OCR artifact detection (penalty)
-    # Look for garbled text indicators
-    long_words = sum(1 for w in text.split() if len(w) > 25)
-    garbage_ratio = long_words / word_count if word_count else 0
-
-    if garbage_ratio < 0.01:
-        scores.append(1.0)
-    elif garbage_ratio < 0.05:
-        scores.append(0.7)
-    else:
-        scores.append(0.3)
-
-    # Weighted average
-    weights = [0.3, 0.25, 0.25, 0.2]  # words, alpha, patterns, artifacts
-    final_score = sum(s * w for s, w in zip(scores, weights))
-
-    return round(final_score, 3)
-```
-
----
-
-## Database Updates
-
-Add new columns to track extraction status:
-
-```python
-# Add to scraper/db.py
-
-def add_extraction_columns():
-    """Add extraction tracking columns to documents table."""
-    conn = get_connection()
-    cursor = conn.cursor()
-
-    # These may already exist, so use IF NOT EXISTS logic
-    new_columns = [
-        ("extraction_status", "TEXT DEFAULT 'pending'"),
-        ("extracted_at", "TEXT"),
-        ("extraction_method", "TEXT"),
-        ("extraction_quality", "REAL"),
-        ("json_path", "TEXT"),
-    ]
-
-    for col_name, col_def in new_columns:
+        # Parse response
         try:
-            cursor.execute(f"ALTER TABLE documents ADD COLUMN {col_name} {col_def}")
-        except:
-            pass  # Column already exists
+            result = json.loads(response.content[0].text)
+            return result
+        except json.JSONDecodeError:
+            return {
+                "error": "Failed to parse LLM response",
+                "raw_response": response.content[0].text[:500]
+            }
 
-    conn.commit()
-    conn.close()
+    def get_cost(self) -> float:
+        """Get total cost so far."""
+        return (self.total_input_tokens * HAIKU_INPUT_COST +
+                self.total_output_tokens * HAIKU_OUTPUT_COST)
 
+    def process_document(self, json_path: Path) -> dict:
+        """Process a single document JSON file."""
 
-def get_pending_extractions(year: int = None) -> list:
-    """Get documents that need extraction."""
-    conn = get_connection()
-    cursor = conn.cursor()
+        with open(json_path) as f:
+            doc = json.load(f)
 
-    sql = """
-        SELECT * FROM documents
-        WHERE download_status = 'downloaded'
-        AND (extraction_status = 'pending' OR extraction_status IS NULL)
-    """
-    if year:
-        sql += f" AND year_tag = {year}"
-    sql += " ORDER BY year_tag DESC, id"
+        # Extract using LLM
+        result = self.extract_sections(doc["content"]["full_text"])
 
-    cursor.execute(sql)
-    results = cursor.fetchall()
-    conn.close()
-    return results
+        if "error" in result:
+            return {"error": result["error"], "path": str(json_path)}
 
+        # Update document
+        doc["sections"]["question_synthetic"] = result.get("question_synthetic")
+        doc["sections"]["conclusion_synthetic"] = result.get("conclusion_synthetic")
 
-def update_extraction_status(doc_id: int, status: str, method: str = None,
-                            quality: float = None, json_path: str = None):
-    """Update extraction status for a document."""
-    conn = get_connection()
-    cursor = conn.cursor()
+        # If LLM found explicit sections we missed, use them
+        if result.get("question_extracted") and not doc["sections"]["question"]:
+            doc["sections"]["question"] = result["question_extracted"]
+        if result.get("conclusion_extracted") and not doc["sections"]["conclusion"]:
+            doc["sections"]["conclusion"] = result["conclusion_extracted"]
 
-    cursor.execute("""
-        UPDATE documents
-        SET extraction_status = ?,
-            extracted_at = datetime('now'),
-            extraction_method = COALESCE(?, extraction_method),
-            extraction_quality = COALESCE(?, extraction_quality),
-            json_path = COALESCE(?, json_path)
-        WHERE id = ?
-    """, (status, method, quality, json_path, doc_id))
+        # Update embedding content
+        qa_parts = []
+        if doc["sections"]["question"] or doc["sections"]["question_synthetic"]:
+            q = doc["sections"]["question"] or doc["sections"]["question_synthetic"]
+            qa_parts.append(f"QUESTION: {q}")
+        if doc["sections"]["conclusion"] or doc["sections"]["conclusion_synthetic"]:
+            c = doc["sections"]["conclusion"] or doc["sections"]["conclusion_synthetic"]
+            qa_parts.append(f"CONCLUSION: {c}")
 
-    conn.commit()
-    conn.close()
-```
+        doc["embedding"]["qa_text"] = "\n\n".join(qa_parts)
+        doc["embedding"]["qa_source"] = "mixed" if doc["sections"]["question"] else "synthetic"
 
----
+        # Update document type if LLM detected non-opinion
+        if result.get("document_type") == "correspondence":
+            doc["parsed"]["document_type"] = "correspondence"
 
-## Heuristic Classification
+        # Save updated document
+        with open(json_path, "w") as f:
+            json.dump(doc, f, indent=2, ensure_ascii=False)
 
-Simple topic classification based on cited code sections:
-
-```python
-# scraper/classifier.py
-
-"""
-Heuristic topic classification based on citations.
-"""
-
-from dataclasses import dataclass
-
-
-# Government Code section ranges by topic
-CONFLICTS_OF_INTEREST_SECTIONS = {
-    # Conflicts of Interest (87100-87500 range)
-    range(87100, 87600),
-    # Economic Interest Disclosure (87200-87210)
-    range(87200, 87220),
-}
-
-CAMPAIGN_FINANCE_SECTIONS = {
-    # Campaign Reporting (84100-84511)
-    range(84100, 84600),
-    # Contributions/Expenditures (85100-85704)
-    range(85100, 85800),
-}
-
-LOBBYING_SECTIONS = {
-    # Lobbyist Registration (86100-86300)
-    range(86100, 86400),
-}
-
-
-def classify_by_citations(citations) -> dict:
-    """
-    Classify document topic based on Government Code citations.
-
-    Returns classification dict with topic_primary, confidence, and method.
-    """
-
-    if not citations.government_code:
         return {
-            "topic_primary": None,
-            "confidence": None,
-            "classification_method": "heuristic:no_citations",
+            "id": doc["id"],
+            "path": str(json_path),
+            "has_synthetic_q": bool(result.get("question_synthetic")),
+            "has_synthetic_c": bool(result.get("conclusion_synthetic")),
+            "document_type": result.get("document_type"),
+            "confidence": result.get("confidence"),
         }
 
-    coi_count = 0
-    cf_count = 0
-    lobby_count = 0
 
-    for cite in citations.government_code:
-        # Extract base section number
-        try:
-            base_num = int(cite.split('(')[0])
-        except ValueError:
+def estimate_cost():
+    """Estimate cost for processing all documents needing LLM."""
+    docs = get_documents_needing_llm()
+    print(f"Documents needing LLM extraction: {len(docs)}")
+
+    # Estimate average tokens per document
+    avg_input_tokens = 3000   # ~15KB of text
+    avg_output_tokens = 300   # JSON response
+
+    total_input = len(docs) * avg_input_tokens
+    total_output = len(docs) * avg_output_tokens
+
+    cost = total_input * HAIKU_INPUT_COST + total_output * HAIKU_OUTPUT_COST
+
+    print(f"Estimated tokens: {total_input:,} input, {total_output:,} output")
+    print(f"Estimated cost: ${cost:.2f}")
+
+
+def process_pending(limit: int = None, dry_run: bool = False):
+    """Process documents flagged for LLM extraction."""
+    docs = get_documents_needing_llm(limit=limit)
+    print(f"Found {len(docs)} documents needing LLM extraction")
+
+    if dry_run:
+        print("Dry run - not processing")
+        return
+
+    extractor = LLMExtractor()
+    results = []
+
+    for i, doc_record in enumerate(docs):
+        json_path = Path(doc_record.json_path) if doc_record.json_path else None
+
+        if not json_path or not json_path.exists():
+            print(f"  [{i+1}/{len(docs)}] SKIP: No JSON file for {doc_record.letter_id}")
             continue
 
-        for range_set in CONFLICTS_OF_INTEREST_SECTIONS:
-            if base_num in range_set:
-                coi_count += 1
-                break
+        print(f"  [{i+1}/{len(docs)}] Processing {doc_record.letter_id}...")
 
-        for range_set in CAMPAIGN_FINANCE_SECTIONS:
-            if base_num in range_set:
-                cf_count += 1
-                break
+        try:
+            result = extractor.process_document(json_path)
+            results.append(result)
 
-        for range_set in LOBBYING_SECTIONS:
-            if base_num in range_set:
-                lobby_count += 1
-                break
+            # Update DB
+            conn = get_connection()
+            cursor = conn.cursor()
+            cursor.execute("""
+                UPDATE documents
+                SET llm_extracted_at = datetime('now'),
+                    needs_llm_extraction = 0
+                WHERE id = ?
+            """, (doc_record.id,))
+            conn.commit()
+            conn.close()
 
-    total = coi_count + cf_count + lobby_count
+            print(f"    ✓ synthetic_q={result.get('has_synthetic_q')}, "
+                  f"type={result.get('document_type')}")
 
-    if total == 0:
-        return {
-            "topic_primary": "other",
-            "confidence": 0.5,
-            "classification_method": "heuristic:unknown_sections",
-        }
+        except Exception as e:
+            print(f"    ✗ ERROR: {e}")
+            results.append({"id": doc_record.letter_id, "error": str(e)})
 
-    # Determine winner
-    if coi_count > cf_count and coi_count > lobby_count:
-        topic = "conflicts_of_interest"
-        confidence = coi_count / total
-    elif cf_count > coi_count and cf_count > lobby_count:
-        topic = "campaign_finance"
-        confidence = cf_count / total
-    elif lobby_count > coi_count and lobby_count > cf_count:
-        topic = "lobbying"
-        confidence = lobby_count / total
+        # Print cost update every 100 docs
+        if (i + 1) % 100 == 0:
+            print(f"    [Cost so far: ${extractor.get_cost():.2f}]")
+
+    print(f"\nCompleted. Total cost: ${extractor.get_cost():.2f}")
+
+
+def main():
+    import argparse
+
+    parser = argparse.ArgumentParser(description="LLM-based extraction (Phase 3B)")
+    parser.add_argument("--process-pending", action="store_true",
+                        help="Process all documents flagged for LLM")
+    parser.add_argument("--process-one", type=int,
+                        help="Process single document by DB id")
+    parser.add_argument("--limit", type=int,
+                        help="Limit number of documents to process")
+    parser.add_argument("--estimate-cost", action="store_true",
+                        help="Estimate cost without processing")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Show what would be processed")
+
+    args = parser.parse_args()
+
+    if args.estimate_cost:
+        estimate_cost()
+    elif args.process_pending:
+        process_pending(limit=args.limit, dry_run=args.dry_run)
+    elif args.process_one:
+        # TODO: implement single document processing
+        print(f"Would process document {args.process_one}")
     else:
-        # Tie - default to conflicts_of_interest (more common)
-        topic = "conflicts_of_interest" if coi_count >= cf_count else "campaign_finance"
-        confidence = 0.5
+        parser.print_help()
 
-    return {
-        "topic_primary": topic,
-        "confidence": round(confidence, 2),
-        "classification_method": "heuristic:citation_based",
-    }
+
+if __name__ == "__main__":
+    main()
 ```
 
 ---
 
-## Estimated Costs & Time
+## Task 3.11: Post-Processing (Citation Graph)
 
-### Phase 3A: Core Extraction
+**File**: `scraper/postprocess.py`
 
-| Component | Documents | Time | Cost |
-|-----------|-----------|------|------|
-| Native extraction (all) | 14,096 | ~2 hours | Free |
-| olmOCR (pre-1995) | ~3,000 | ~8 hours | ~$2.50 |
-| olmOCR (failures) | ~1,000 | ~3 hours | ~$1.00 |
-| **Total** | 14,096 | ~13 hours | **~$3.50** |
+```python
+# scraper/postprocess.py
 
-### Phase 3B & 3C: Parsing & Citations
+"""
+Post-processing to build citation graph (cited_by relationships).
 
-| Component | Documents | Time | Cost |
-|-----------|-----------|------|------|
-| Section parsing | 14,096 | ~10 min | Free |
-| Citation extraction | 14,096 | ~10 min | Free |
-| Quality scoring | 14,096 | ~5 min | Free |
+Usage:
+    python -m scraper.postprocess --build-citation-graph
+"""
+
+import json
+from pathlib import Path
+from collections import defaultdict
+
+from .config import DATA_DIR
+
+EXTRACTED_DIR = DATA_DIR / "extracted"
+
+
+def build_citation_graph():
+    """
+    Build cited_by relationships across all documents.
+
+    For each document, find all other documents that cite it
+    and populate the cited_by field.
+    """
+
+    # Phase 1: Build index of all documents and their citations
+    print("Phase 1: Scanning documents...")
+
+    doc_index = {}  # id -> filepath
+    cites_index = defaultdict(list)  # cited_id -> [citing_ids]
+
+    for year_dir in EXTRACTED_DIR.iterdir():
+        if not year_dir.is_dir():
+            continue
+
+        for json_file in year_dir.glob("*.json"):
+            with open(json_file) as f:
+                doc = json.load(f)
+
+            doc_id = doc["id"]
+            doc_index[doc_id] = json_file
+
+            # Record citations
+            for cited_id in doc["citations"]["prior_opinions"]:
+                cites_index[cited_id].append(doc_id)
+
+    print(f"  Indexed {len(doc_index)} documents")
+    print(f"  Found {len(cites_index)} cited documents")
+
+    # Phase 2: Update documents with cited_by
+    print("Phase 2: Updating cited_by relationships...")
+
+    updated = 0
+    for doc_id, citing_ids in cites_index.items():
+        if doc_id not in doc_index:
+            continue  # Cited document not in our corpus
+
+        filepath = doc_index[doc_id]
+        with open(filepath) as f:
+            doc = json.load(f)
+
+        # Update cited_by
+        doc["citations"]["cited_by"] = sorted(set(citing_ids))
+
+        with open(filepath, "w") as f:
+            json.dump(doc, f, indent=2, ensure_ascii=False)
+
+        updated += 1
+
+    print(f"  Updated {updated} documents with cited_by data")
+
+    # Stats
+    cited_counts = [len(v) for v in cites_index.values()]
+    if cited_counts:
+        print(f"\nCitation statistics:")
+        print(f"  Most cited: {max(cited_counts)} times")
+        print(f"  Average citations: {sum(cited_counts)/len(cited_counts):.1f}")
+
+
+def main():
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Post-processing")
+    parser.add_argument("--build-citation-graph", action="store_true",
+                        help="Build cited_by relationships")
+
+    args = parser.parse_args()
+
+    if args.build_citation_graph:
+        build_citation_graph()
+    else:
+        parser.print_help()
+
+
+if __name__ == "__main__":
+    main()
+```
+
+---
+
+## Estimated Costs
+
+| Component | Documents | Tokens | Cost |
+|-----------|-----------|--------|------|
+| Native extraction | 14,096 | N/A | Free |
+| olmOCR (pre-1990 + failures) | ~4,000 | ~20M | ~$17 |
+| Claude Haiku (low-confidence) | ~5,000 | ~16.5M | ~$8 |
+| **Total** | 14,096 | ~36.5M | **~$25** |
+
+With your $100 budget ceiling, there's ample room for:
+- Processing retries
+- Additional LLM calls for edge cases
+- Quality improvements
 
 ---
 
 ## CLI Commands Summary
 
 ```bash
-# Initialize extraction columns
+# Task 3.6: Initialize database columns
 python -m scraper.extractor --init
 
-# Extract all pending documents
+# Task 3.8: Extract review sample (50 docs across eras)
+python -m scraper.extractor --extract-sample 50
+
+# Review sample results
+ls data/extracted/
+cat data/extracted/sample_summary.json | jq
+
+# Task 3.7: Full extraction (Phase 3A) - native + regex
 python -m scraper.extractor --extract-all
 
-# Extract specific year
-python -m scraper.extractor --extract-year 2024
+# Task 3.7 alternate: Skip olmOCR for speed
+python -m scraper.extractor --extract-all --skip-olmocr
 
-# Extract single document (for testing)
-python -m scraper.extractor --extract-one 12345
-
-# Show statistics
+# Check progress
 python -m scraper.extractor --stats
 
-# Dry run (show what would be done)
-python -m scraper.extractor --extract-all --dry-run
+# Task 3.9: Estimate LLM costs
+python -m scraper.llm_extractor --estimate-cost
 
-# Force olmOCR on everything (expensive!)
-python -m scraper.extractor --extract-year 1990 --force-olmocr
+# Task 3.9: Run LLM extraction (Phase 3B)
+python -m scraper.llm_extractor --process-pending
 
-# Skip olmOCR entirely (native only, fast but lower quality for old docs)
-python -m scraper.extractor --extract-all --skip-olmocr
+# Task 3.9 alternate: Process limited batch
+python -m scraper.llm_extractor --process-pending --limit 100
+
+# Task 3.11: Build citation graph
+python -m scraper.postprocess --build-citation-graph
 ```
 
 ---
@@ -1231,6 +2113,7 @@ python -m scraper.extractor --extract-all --skip-olmocr
 # tests/test_section_parser.py
 
 def test_modern_format():
+    """Test extraction from modern FPPC format."""
     text = """
     QUESTION
 
@@ -1243,97 +2126,62 @@ def test_modern_format():
     FACTS
 
     The requestor is a city council member.
-
-    ANALYSIS
-
-    Government Code Section 87100 provides...
     """
 
-    result = parse_sections(text)
+    result = parse_sections(text, year=2024)
     assert result.has_standard_format
+    assert result.extraction_confidence >= 0.8
     assert "vote on the contract" in result.question
     assert "may not vote" in result.conclusion
 
 
-def test_old_format():
+def test_no_false_positive():
+    """Test that mid-paragraph 'question' doesn't trigger extraction."""
     text = """
-    QUESTION PRESENTED
+    Dear Mr. Smith:
 
-    May an official participate in a decision?
+    This letter addresses your inquiry. The central question
+    is whether the official may participate. We conclude that
+    the answer depends on the facts.
 
-    SHORT ANSWER
+    ANALYSIS
 
-    The official should not participate.
+    Government Code Section 87100...
     """
 
-    result = parse_sections(text)
-    assert result.has_standard_format
-    assert "participate" in result.question
+    result = parse_sections(text, year=2020)
+    # Should NOT extract the mid-paragraph "question"
+    assert result.question is None or result.extraction_confidence < 0.5
 ```
 
-### Integration Tests
+### Integration Test Workflow
 
 ```bash
-# Test extraction on sample documents
-python -m scraper.extractor --extract-one 1      # 1975 doc
-python -m scraper.extractor --extract-one 5000   # 1990s doc
-python -m scraper.extractor --extract-one 14000  # 2024 doc
+# 1. Extract small sample
+python -m scraper.extractor --extract-sample 10
 
-# Verify output
-cat data/extracted/2024/A-24-006.json | jq '.sections'
+# 2. Manually review JSON files
+cat data/extracted/2024/*.json | jq '.sections'
+
+# 3. Check extraction quality
+python -m scraper.extractor --stats
+
+# 4. If quality looks good, run full extraction
+python -m scraper.extractor --extract-all
 ```
 
 ---
 
 ## Next Steps After Phase 3
 
-### Phase 4: LLM Enrichment (Future)
+### Phase 4: Search Infrastructure
+1. Load JSON into Meilisearch or similar
+2. Create faceted search by topic, year, citations
+3. Generate embeddings for `embedding.qa_text`
+4. Build search API
 
-For documents where:
-- `sections.has_standard_format == false`
-- `classification.topic_primary is null`
-- We want granular topic tags
-
-Run through Claude/GPT to:
-1. Generate synthetic Q&A
-2. Classify topics with high confidence
-3. Generate searchable summaries
-4. Extract granular topic tags
-
-### Phase 5: Search Infrastructure (Future)
-
-1. Load all JSON into search index (Meilisearch recommended)
-2. Generate embeddings for `sections.question` + `sections.conclusion`
-3. Generate chunk embeddings for `content.full_text`
-4. Build faceted search with `classification.topic_primary` filter
-
----
-
-## Dependencies
-
-Add to `requirements.txt`:
-
-```
-# Existing
-requests
-pymupdf
-
-# New for Phase 3
-openai          # DeepInfra client (OpenAI-compatible)
-python-dotenv   # Environment variable loading
-pydantic>=2.0   # Schema validation (optional but recommended)
-```
-
----
-
-## Implementation Order
-
-1. **Create `scraper/schema.py`** - Define all dataclasses
-2. **Create `scraper/quality.py`** - Quality scoring
-3. **Create `scraper/section_parser.py`** - Section extraction
-4. **Create `scraper/citation_extractor.py`** - Citation extraction
-5. **Create `scraper/classifier.py`** - Heuristic classification
-6. **Update `scraper/db.py`** - Add extraction tracking columns
-7. **Create `scraper/extractor.py`** - Main extraction logic + CLI
-8. **Test on samples** - One doc from each era
-9. **Run full extraction** - All 14,096 documents
+### Phase 5: Advanced Features
+1. MCP server for Claude.ai integration
+2. RAG pipeline for question answering
+3. Citation network visualization
+4. Topic trend analysis over time
