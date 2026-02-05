@@ -188,80 +188,127 @@ python -m scraper.crawler --download-stats     # Show download progress
 
 ## Phase 3: Extract Text
 
-**Objective:** Extract text from all PDFs, using OCR when necessary.
+**Objective:** Extract text from all PDFs, with structured output optimized for RAG and search.
 
-### Extraction Pipeline
+**Status:** In Progress - Core extraction pipeline implemented
 
-```
-For each PDF:
-1. Try native extraction (PyMuPDF)
-2. Compute quality score:
-   - word_count / page_count ratio
-   - % alphabetic characters
-   - presence of expected patterns (QUESTION, date, etc.)
-3. If quality < threshold:
-   - Extract page images
-   - Run Tesseract OCR
-   - Re-score
-4. Parse structured fields:
-   - Date
-   - File number (A-XX-XXX, I-XX-XXX)
-   - Requestor name
-   - Sections (QUESTION, CONCLUSION, ANALYSIS)
-5. Store extracted text + metadata
-```
+### Phase 3A: Core Extraction (Python + olmOCR)
+
+Build the extraction pipeline in Python with olmOCR as the OCR fallback for scanned documents.
+
+#### Completed Tasks
+
+- [x] **Task 3.1: Schema Design** - `scraper/schema.py`
+  - Defined `FPPCDocument` dataclass with nested structures for sections, citations, classification
+  - `to_json()` / `from_json()` serialization helpers
+
+- [x] **Task 3.2: Quality Scoring** - `scraper/quality.py`
+  - `compute_quality_score()` → 0.0-1.0 based on words/page, alpha ratio, FPPC patterns
+  - `should_use_olmocr()` → Decision logic for OCR fallback
+
+- [x] **Task 3.3: Section Parser** - `scraper/section_parser.py`
+  - `parse_sections()` → Extracts QUESTION, CONCLUSION, FACTS, ANALYSIS
+  - Handles multiple format eras (modern, 1990s, 1980s variants)
+  - Returns confidence score and extraction method
+
+- [x] **Task 3.4: Citation Extractor** - `scraper/citation_extractor.py`
+  - `extract_citations()` → Government Code, regulations, prior opinions, external cases
+  - Validates sections against Political Reform Act ranges
+  - Normalizes citation formats
+
+- [x] **Task 3.5: Topic Classifier** - `scraper/classifier.py`
+  - `classify_by_citations()` → conflicts_of_interest | campaign_finance | lobbying | other
+  - Based on Government Code section ranges
+
+- [x] **Task 3.6: Database Tracking** - `scraper/db.py`
+  - `add_extraction_columns()` → Added extraction tracking fields
+  - `get_pending_extractions()`, `update_extraction_status()`
+  - `get_documents_needing_llm()` for Phase 3B
+
+- [x] **Task 3.7: Core Extractor** - `scraper/extractor.py`
+  - `Extractor` class orchestrates full pipeline
+  - PyMuPDF native extraction with olmOCR fallback (via DeepInfra API)
+  - CLI: `--extract-all`, `--extract-sample`, `--stats`, `--skip-olmocr`
+  - Saves JSON to `data/extracted/{year}/{letter_id}.json`
+  - Updates database with status, quality, section_confidence
+
+#### Remaining Tasks
+
+- [ ] **Task 3.8: Full Extraction Run**
+  - Run `--extract-all --skip-olmocr` for fast first pass
+  - Analyze documents flagged for olmOCR
+  - Run selective olmOCR on low-quality extractions
+
+### Phase 3B: LLM-Enhanced Extraction (Future)
+
+For documents where regex extraction fails (section_confidence < 0.5):
+
+- [ ] Use Claude Haiku to generate synthetic Q/A pairs
+- [ ] Fill `question_synthetic` and `conclusion_synthetic` fields
+- [ ] Generate document summaries for `embedding.summary`
 
 ### Output Format
 
 ```
-data/
-├── documents.db          # SQLite with metadata
-├── extracted/
-│   ├── 2024/
-│   │   ├── 24006.json    # Structured extraction
-│   │   └── 24006.txt     # Raw text
-│   ├── 2015/
+data/extracted/
+├── 2024/
+│   ├── A-24-006.json    # Full structured document
+│   ├── I-24-008.json
 │   └── ...
+├── 2023/
+└── ...
 ```
 
-JSON structure:
+JSON structure (FPPCDocument schema):
 ```json
 {
   "id": "A-24-006",
   "year": 2024,
-  "date": "2024-01-23",
-  "requestor": "Alan J. Peake",
-  "city": "Bakersfield",
-  "letter_type": "formal",
-  "extraction_method": "native",
-  "page_count": 4,
-  "word_count": 1713,
-  "sections": {
-    "question": "...",
-    "conclusion": "...",
-    "facts": "...",
-    "analysis": "..."
-  },
-  "full_text": "...",
-  "pdf_url": "https://...",
-  "tags": ["Advice Letter", "2024"]
+  "pdf_url": "https://fppc.ca.gov/...",
+  "pdf_sha256": "...",
+  "local_pdf_path": "raw_pdfs/2024/24006.pdf",
+  "source_metadata": { "title_raw": "...", "tags": [...], "scraped_at": "..." },
+  "extraction": { "method": "native", "quality_score": 0.85, "page_count": 4, ... },
+  "content": { "full_text": "...", "full_text_markdown": null },
+  "parsed": { "date": "2024-01-23", "requestor_name": "...", "document_type": "advice_letter" },
+  "sections": { "question": "...", "conclusion": "...", "facts": "...", "analysis": "..." },
+  "citations": { "government_code": ["87100"], "regulations": [...], "prior_opinions": [...] },
+  "classification": { "topic_primary": "conflicts_of_interest", "confidence": 0.9 },
+  "embedding": { "qa_text": "...", "first_500_words": "..." }
 }
 ```
 
-### Tasks
+### Extraction Statistics (Partial Run)
 
-- [ ] Build extraction module
-- [ ] Define quality threshold (experiment with samples)
-- [ ] Implement OCR fallback
-- [ ] Write section parser (QUESTION/CONCLUSION/etc.)
-- [ ] Store results as JSON + txt files
-- [ ] Update database with extraction status
+| Metric | Value |
+|--------|-------|
+| Documents tested | ~15 |
+| Native extraction success | ~70% |
+| Quality score > 0.8 | ~55% |
+| Needs olmOCR | ~25% (pre-1990 + low quality) |
+| Section parsing success | ~85% for modern (2000+) |
 
-### Estimated Time
-- Native extraction: ~0.5 seconds per PDF
-- OCR: ~5-10 seconds per page
-- Estimate 20-30% need OCR
-- Total: ~5-10 hours
+### CLI Commands
+
+```bash
+# Initialize extraction columns
+python -m scraper.extractor --init
+
+# Extract sample across eras for review
+python -m scraper.extractor --extract-sample 50
+
+# Full extraction (native + olmOCR fallback)
+python -m scraper.extractor --extract-all
+
+# Skip olmOCR for faster/cheaper run
+python -m scraper.extractor --extract-all --skip-olmocr
+
+# Extract specific year
+python -m scraper.extractor --extract-all --year 2024
+
+# Show extraction statistics
+python -m scraper.extractor --stats
+```
 
 ---
 
