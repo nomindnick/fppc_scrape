@@ -33,7 +33,7 @@ The implementation is divided into discrete, sequential tasks:
 |------|--------|-------------|--------------|--------|
 | **3.1** | `schema.py` | Define all dataclasses | None | ✓ Complete |
 | **3.2** | `quality.py` | Text quality scoring | None | ✓ Complete |
-| **3.3** | `section_parser.py` | Regex section extraction with validation | None | |
+| **3.3** | `section_parser.py` | Regex section extraction with validation | None | ✓ Complete |
 | **3.4** | `citation_extractor.py` | Legal citation extraction | None | ✓ Complete |
 | **3.5** | `classifier.py` | Heuristic topic classification | 3.4 | |
 | **3.6** | `db.py` additions | Add extraction tracking columns | None | |
