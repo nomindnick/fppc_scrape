@@ -37,6 +37,37 @@ from typing import Literal
 # Minimum words for a section to be considered valid
 MIN_SECTION_WORDS = 10
 
+# Boilerplate patterns that bleed into section content (removed during cleaning)
+BOILERPLATE_PATTERNS = [
+    # PRA footnote (clean): "1 The Political Reform Act is contained in Government Code Sections 81000..."
+    r'\d?\s*The Political Reform Act is contained in Government Code Sections?\s+81000.*?(?:unless otherwise indicated\.?\s*)',
+    # PRA footnote (OCR-tolerant): superscript "1" → "I","t","'","/" or missing; garbled "Government"
+    # Matches: "I The Political Reform Act...", "t Government Code sections 81000..."
+    # Also catches: "Go,r\"..r*\"nt Code Sections SIOOO-91015..."
+    r'[1ItI\'/]?\s*(?:The\s+)?[Pp]olitical\s+[Rr]efor[mn]\w?\s+[Aa]ct\s+is\s+conta[im]\w+\s+in\s+G[\w.,\"\'\*\s]{0,15}(?:Code|code)\s+[Ss]ect\w*\s+(?:8[1lI]0{2,3}|SIOOO).*?(?:unless\s+otherwise\s+indicated|California\s+Code\s+of\s+Reg|Code\s+of\s+Reg).*?(?:indicated\.?\s*|Regulations?\.?\s*)',
+    # PRA footnote (heavily garbled): anchor on "Government Code Sections 81000" variants
+    r'[1ItI\'/]?\s*G[\w.,\"\s]{0,12}(?:Code|code)\s+[Ss]ect\w*\s+(?:8[1lI]0{2,3}|SIOOO)[\s\S]{0,300}?(?:unless\s+otherwise\s+indicated|Cal\w*\s+Code\s+of\s+Reg\w*)\.?\s*',
+    # Regulation footnote: "The regulations of the Fair Political Practices Commission..."
+    r'[1ItI\'/]?\s*(?:The\s+)?[Rr]eg\w+\s+of\s+the\s+Fair\s+Political\s+Practices\s+Comm\w+\s+are\s+contained.*?(?:unless\s+otherwise\s+indicated|California\s+Code\s+of\s+Reg\w*)\.?\s*',
+    # Combined PRA + regulation footnote (single block spanning both sentences)
+    r'[1ItI\'/]?\s*(?:The\s+)?[Pp]olitical\s+[Rr]eform\s+[Aa]ct.*?(?:California\s+Code\s+of\s+Reg\w*|Code\s+of\s+Reg\w*)[\s\S]{0,50}?(?:unless\s+otherwise\s+indicated|otherwise\s+indicated)\.?\s*',
+    # Page headers with file numbers
+    r'File\s+No\.\s*[AIM]?-?\d{2}-?\d{3,4}\s*(?:/?\s*Page\s*(?:No\.)?\s*\d+)?',
+    # FPPC address blocks
+    r'(?:428\s+J\s+Street|1102\s+Q\s+Street).*?(?:\d{5}(?:-\d{4})?)',
+    # Standalone page references
+    r'\n\s*Page\s+(?:No\.)?\s*\d+(?:\s+of\s+\d+)?',
+    # Old-style footnote: "1/ Government Code Section 81000-91015..."
+    r'\d\s*/\s*G[\w.,\"\s]{0,12}(?:Code|code)\s+[Ss]ect\w*\s+8[1lI]0{2,3}.*?(?:\d{5}(?:-\d{4})?)',
+    # Standalone second sentence: "All regulatory references are to Title 2, Division 6..."
+    # OCR variants: AJI, A1l, AII, A11; "arc"/"axe" for "are"; no leading whitespace
+    r'A[Il1J][Il1J]\s+regulatory\s+references\s+ar[ec]\s+to\s+Title\s+2.*?(?:unless\s+otherwise\s+indicated|otherwise\s+indicated)\.?\s*',
+    # Old-format regulation footnote: "Commission regulations appear at 2 California Administrative Code..."
+    r'Commission\s+regulations?\s+appear\s+at\s+.*?(?:Code\s+(?:of\s+)?Reg|Administrative\s+Code)\w*.*?(?:et\s+seq\.?|section\s+\d{4,5}).*?\s*',
+    # Standalone statutory references sentence: "All statutory references are to the Government Code..."
+    r'A[Il1J][Il1J]\s+statutory\s+references\s+ar[ec]\s+to\s+the\s+Government\s+Code.*?(?:unless\s+otherwise\s+indicated|otherwise\s+indicated)\.?\s*',
+]
+
 # Section types we extract
 SectionType = Literal["question", "conclusion", "facts", "analysis"]
 
@@ -76,6 +107,38 @@ SECTION_PATTERNS: list[tuple[str, SectionType, str]] = [
     (r'^[ \t]{0,4}STATEMENT\s+OF\s+FACTS?\s*[:\n]?', 'facts', 'old'),
     (r'^[ \t]{0,4}FACTUAL\s+BACKGROUND\s*[:\n]?', 'facts', 'old'),
     (r'^[ \t]{0,4}LEGAL\s+ANALYSIS\s*[:\n]?', 'analysis', 'old'),
+
+    # OCR-tolerant patterns (checked last — only activate when clean patterns fail)
+    # Q↔O substitution: "OUESTION" for "QUESTION"
+    (r'^[ \t]{0,4}[OQ]UESTIONS?\s*[:\n]?$', 'question', 'ocr'),
+    # Spaced characters: "Q U E S T I O N"
+    (r'^[ \t]{0,4}Q\s*U\s*E\s*S\s*T\s*I\s*O\s*N', 'question', 'ocr'),
+    (r'^[ \t]{0,4}C\s*O\s*N\s*C\s*L\s*U\s*S\s*I\s*O\s*N', 'conclusion', 'ocr'),
+    (r'^[ \t]{0,4}A\s*N\s*A\s*L\s*Y\s*S\s*I\s*S', 'analysis', 'ocr'),
+    # Common OCR misreads
+    (r'^[ \t]{0,4}QUESTTONS?\s*[:\n]?$', 'question', 'ocr'),  # I→T
+    (r'^[ \t]{0,4}ANALYSTS\s*[:\n]?$', 'analysis', 'ocr'),     # I→T
+    (r'^[ \t]{0,4}[rF]ACTS\s*[:\n]?$', 'facts', 'ocr'),       # F→r
+    # Combined headers
+    (r'^[ \t]{0,4}CONCLUSIONS?\s+AND\s+ANALYSIS\s*[:\n]?$', 'conclusion', 'ocr'),
+
+    # Additional OCR variants (from calibration v2)
+    # QT.JESTTON, QTJESTTON — Q→QT, U→JE, I→T
+    (r'^[ \t]{0,4}QT\.?J?E?S?T?[TI]?ON', 'question', 'ocr'),
+    # OUESTI ON — space inserted mid-word
+    (r'^[ \t]{0,4}[OQ]UE?STI?\s+ON', 'question', 'ocr'),
+    # OUESTTON — double garble
+    (r'^[ \t]{0,4}[OQ]UESTTON', 'question', 'ocr'),
+    # CONCLUSfONS — f for I
+    (r'^[ \t]{0,4}CONCLUS[fI]?ONS?\s*[:\n]?$', 'conclusion', 'ocr'),
+    # CONCLU SION — space inside
+    (r'^[ \t]{0,4}CONCLU\s*S\s*IONS?\s*[:\n]?$', 'conclusion', 'ocr'),
+    # FACT S — space inside
+    (r'^[ \t]{0,4}FACT\s+S\b', 'facts', 'ocr'),
+    # AI\ALYSIS, A}[ALYSIS, AMALYSIS — various garbles of N
+    (r'^[ \t]{0,4}A[I}\]\\NM]+[LA]*[LY]+S[IT1]S\s*[:\n]?$', 'analysis', 'ocr'),
+    # ANA LYSIS — space inside
+    (r'^[ \t]{0,4}ANA\s*LYSIS\s*[:\n]?$', 'analysis', 'ocr'),
 ]
 
 # Patterns that indicate end of document content (before signature)
@@ -88,6 +151,9 @@ DOCUMENT_END_PATTERNS = [
     r'\n[ \t]*Chief Counsel',
     r'\n[ \t]*\*\s*\*\s*\*[ \t]*\n',  # *** divider
     r'\n[ \t]*\* \* \*[ \t]*\n',
+    # OCR-tolerant variants
+    r'\n[ \t]*[Ss]incerely\s*[,.]',
+    r'\n[ \t]*[Ss]incere[1l]y\s*[,.]',  # OCR: l→1
 ]
 
 
@@ -247,6 +313,10 @@ def _clean_section_content(content: str) -> str:
     content = re.sub(r'\f', '\n', content)
     content = re.sub(r'\n[ \t]*-?\d+-[ \t]*\n', '\n', content)  # Page numbers like "-3-"
     content = re.sub(r'\n[ \t]*Page \d+ of \d+[ \t]*\n', '\n', content, flags=re.IGNORECASE)
+
+    # Remove boilerplate patterns
+    for pattern in BOILERPLATE_PATTERNS:
+        content = re.sub(pattern, '', content, flags=re.IGNORECASE | re.DOTALL)
 
     # Normalize line endings
     content = content.replace('\r\n', '\n').replace('\r', '\n')

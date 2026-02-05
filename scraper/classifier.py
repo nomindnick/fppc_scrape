@@ -34,7 +34,7 @@ from typing import Literal
 # =============================================================================
 
 
-TopicType = Literal["conflicts_of_interest", "campaign_finance", "lobbying", "other"]
+TopicType = Literal["conflicts_of_interest", "campaign_finance", "lobbying", "gifts_honoraria", "other"]
 
 
 # =============================================================================
@@ -78,14 +78,25 @@ TOPIC_RANGES: dict[str, list[range]] = {
         range(87100, 87501),  # General conflicts, disqualification (87100-87500)
         range(87200, 87221),  # Economic disclosure - SEI (87200-87220)
         range(87300, 87316),  # Designated employees, disclosure (87300-87315)
+        range(1090, 1098),    # Section 1090 contractual conflicts (1090-1097)
+        range(82028, 82049),  # Definitions: gift, income, interest (82028-82048)
+        range(87000, 87100),  # General provisions (87000-87099)
+        range(91000, 91015),  # Enforcement (91000-91014)
     ],
     "campaign_finance": [
         range(84100, 84601),  # Campaign reporting requirements (84100-84600)
         range(85100, 85801),  # Contributions and expenditures (85100-85800)
-        range(89500, 89601),  # Mass mailing restrictions (89500-89600)
+        range(82013, 82028),  # Campaign-related definitions (82013-82027)
+        range(84200, 84304),  # Campaign filing requirements (84200-84303)
+        range(88000, 88006),  # Ballot pamphlet provisions (88000-88005)
     ],
     "lobbying": [
         range(86100, 86401),  # Lobbyist registration and reporting (86100-86400)
+    ],
+    "gifts_honoraria": [
+        range(89500, 89522),  # Gift and honoraria restrictions (89500-89521)
+        range(89100, 89200),  # Honoraria prohibitions (89100-89199)
+        range(83111, 83116),  # Gift limits related (83111-83115)
     ],
 }
 
@@ -195,6 +206,7 @@ def classify_by_citations(government_code_citations: list[str]) -> Classificatio
         "conflicts_of_interest": 0,
         "campaign_finance": 0,
         "lobbying": 0,
+        "gifts_honoraria": 0,
         "other": 0,
     }
 

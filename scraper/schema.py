@@ -30,7 +30,7 @@ ExtractionMethod = Literal["native", "olmocr", "native+olmocr"]
 DocumentType = Literal[
     "advice_letter", "opinion", "informal_advice", "correspondence", "other", "unknown"
 ]
-TopicType = Literal["conflicts_of_interest", "campaign_finance", "lobbying", "other"]
+TopicType = Literal["conflicts_of_interest", "campaign_finance", "lobbying", "gifts_honoraria", "other"]
 SectionExtractionMethod = Literal["regex", "regex_validated", "llm", "none"]
 QASource = Literal["extracted", "synthetic", "mixed"]
 

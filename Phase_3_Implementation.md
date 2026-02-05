@@ -38,7 +38,7 @@ The implementation is divided into discrete, sequential tasks:
 | **3.5** | `classifier.py` | Heuristic topic classification | 3.4 | ✓ Complete |
 | **3.6** | `db.py` additions | Add extraction tracking columns | None | ✓ Complete |
 | **3.7** | `extractor.py` | Core extraction pipeline (Phase 3A) | 3.1-3.6 | ✓ Complete |
-| **3.8** | Review & calibrate | Manual review of 50-doc sample | 3.7 | |
+| **3.8** | Review & calibrate | Manual review of 50-doc sample | 3.7 | ✓ Complete |
 | **3.9** | `llm_extractor.py` | LLM-based section extraction | 3.8 | |
 | **3.10** | Full extraction run | Process all 14,096 documents | 3.9 | |
 | **3.11** | Post-processing | Build citation graph, compute `cited_by` | 3.10 | |
