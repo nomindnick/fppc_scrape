@@ -76,10 +76,22 @@ OLMOCR_MODEL = "allenai/olmOCR-2-7B-1025"
 OLMOCR_MAX_PAGES = 20  # Limit pages per document to control cost
 OLMOCR_COST_PER_MILLION_TOKENS = 0.86  # Approximate cost
 
+# Month name regex — includes standard spellings + common OCR variants
+_MONTH_NAMES = (
+    r'(?:January|February|March|April|May|June|July|August|September|October|November|December'
+    r'|Ianuary|Lanuary|Januarv|Februarv|Febniary|Iarch|Inarch|Aprii|Apnl|Mav'
+    r'|Iune|Lune|Iuly|Luly|Idy|htly|Julv|Jidy|Juiy'
+    r'|Augusl|Augusi|Septeinber|Septernber|Octoher'
+    r'|Noveinber|Novernber|Deceinber|Decernber)'
+)
+
 # Date parsing patterns
 DATE_PATTERNS = [
-    # "January 23, 2024"
-    (r'(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{1,2}),?\s+(\d{4})',
+    # "January 23, 2024", "May26, 1998", "June 27,2002", "Iuly 23, L99L"
+    (rf'({_MONTH_NAMES})\s*(\d{{1,2}})[,.\s]\s*(\d{{4}}|[Ll0-9O]{{4}})',
+     lambda m: f"{_fix_ocr_year(m.group(3))}-{_month_to_num(m.group(1))}-{int(m.group(2)):02d}"),
+    # "January 23, 2024" with comma separator (strict, to avoid false positives)
+    (rf'({_MONTH_NAMES})\s*(\d{{1,2}}),?\s*(\d{{4}})',
      lambda m: f"{m.group(3)}-{_month_to_num(m.group(1))}-{int(m.group(2)):02d}"),
     # "01/23/2024" or "1/23/24"
     (r'(\d{1,2})/(\d{1,2})/(\d{2,4})',
@@ -92,10 +104,42 @@ MONTH_MAP = {
     'september': '09', 'october': '10', 'november': '11', 'december': '12',
 }
 
+# OCR misspellings of month names mapped to canonical forms
+OCR_MONTH_MAP = {
+    'iuly': 'july', 'idy': 'july', 'htly': 'july', 'julv': 'july',
+    'luly': 'july', 'jidy': 'july', 'juiy': 'july',
+    'iune': 'june', 'lune': 'june',
+    'ianuary': 'january', 'lanuary': 'january', 'januarv': 'january',
+    'februarv': 'february', 'febniary': 'february',
+    'iarch': 'march', 'inarch': 'march',
+    'aprii': 'april', 'apnl': 'april',
+    'mav': 'may',
+    'augusl': 'august', 'augusi': 'august',
+    'septeinber': 'september', 'septernber': 'september',
+    'octoher': 'october', 'octoher': 'october',
+    'noveinber': 'november', 'novernber': 'november',
+    'deceinber': 'december', 'decernber': 'december',
+}
+
 
 def _month_to_num(month: str) -> str:
-    """Convert month name to two-digit number."""
-    return MONTH_MAP.get(month.lower(), '01')
+    """Convert month name (including OCR variants) to two-digit number."""
+    lower = month.lower()
+    # Try direct match first
+    if lower in MONTH_MAP:
+        return MONTH_MAP[lower]
+    # Try OCR correction
+    canonical = OCR_MONTH_MAP.get(lower)
+    if canonical:
+        return MONTH_MAP[canonical]
+    return '01'
+
+
+def _fix_ocr_year(year_str: str) -> str:
+    """Fix common OCR garbles in year strings: L→1, O→0, strip spaces/hyphens."""
+    fixed = year_str.replace('L', '1').replace('l', '1').replace('O', '0').replace('o', '0')
+    fixed = fixed.replace(' ', '').replace('-', '')
+    return fixed
 
 
 def _expand_year(year_str: str) -> str:
@@ -107,6 +151,103 @@ def _expand_year(year_str: str) -> str:
     if year <= 25:
         return f"20{year:02d}"
     return f"19{year:02d}"
+
+
+def _extract_letter_id_from_text(text: str) -> str | None:
+    """
+    Try to extract a letter ID from the document text header.
+
+    Looks for "Our File No." / "File No." patterns in the first 3000 chars.
+
+    Returns:
+        Normalized letter ID like "A-22-078", or None if not found.
+    """
+    header = text[:3000]
+    match = re.search(
+        r'(?:Our\s+)?File\s+No\.?\s*([AIM]?)\s*-?\s*(\d{2})\s*-?\s*(\d{3,4})',
+        header, re.IGNORECASE,
+    )
+    if match:
+        prefix = match.group(1).upper() or "A"
+        year_part = match.group(2)
+        num_part = match.group(3)
+        return f"{prefix}-{year_part}-{num_part}"
+    return None
+
+
+def _build_self_id_variants(letter_id: str) -> set[str]:
+    """
+    Build a set of variant forms for a letter ID to detect self-citations.
+
+    E.g. "A-22-078" → {"A-22-078", "22-078", "22078", "A22078"}
+         "90-753"   → {"90-753", "90753", "A-90-753", "I-90-753", ...}
+         "84263"    → {"84263", "84-263", "A-84-263", "I-84-263", ...}
+         "83A195"   → {"83A195", "A-83-195", ...}
+    """
+    variants = {letter_id.upper()}
+    lid = letter_id.upper()
+
+    # Case 1: Already has prefix — "A-22-078", "I-91-495"
+    m = re.match(r'^([AIM])-(\d{2})-(\d{3,4})$', lid)
+    if m:
+        prefix, yy, nnn = m.group(1), m.group(2), m.group(3)
+        bare = f"{yy}-{nnn}"
+        variants.update({
+            bare,                           # "22-078"
+            bare.replace("-", ""),           # "22078"
+            f"{prefix}{yy}{nnn}",           # "A22078"
+            lid.replace("-", ""),            # "A22078" (same)
+        })
+        return variants
+
+    # Case 2: "YY-NNN" bare format — "90-753", "07-164"
+    m = re.match(r'^(\d{2})-(\d{3,4})$', lid)
+    if m:
+        yy, nnn = m.group(1), m.group(2)
+        variants.update({
+            f"{yy}{nnn}",                   # "90753"
+            f"A-{yy}-{nnn}",               # "A-90-753"
+            f"I-{yy}-{nnn}",               # "I-90-753"
+            f"M-{yy}-{nnn}",               # "M-90-753"
+        })
+        return variants
+
+    # Case 3: "YYNNN" compact format — "84263", "88460"
+    m = re.match(r'^(\d{2})(\d{3,4})$', lid)
+    if m:
+        yy, nnn = m.group(1), m.group(2)
+        variants.update({
+            f"{yy}-{nnn}",                  # "84-263"
+            f"A-{yy}-{nnn}",               # "A-84-263"
+            f"I-{yy}-{nnn}",               # "I-84-263"
+            f"M-{yy}-{nnn}",               # "M-84-263"
+        })
+        return variants
+
+    # Case 4: "YYA###" old format — "83A195", "82A037"
+    m = re.match(r'^(\d{2})([AIM])(\d{3,4})$', lid)
+    if m:
+        yy, prefix, nnn = m.group(1), m.group(2), m.group(3)
+        variants.update({
+            f"{prefix}-{yy}-{nnn}",         # "A-83-195"
+            f"{yy}-{nnn}",                  # "83-195"
+            f"{yy}{nnn}",                   # "83195"
+        })
+        return variants
+
+    # Case 5: Complex IDs like "16-079-1090" or "78ADV-78-039"
+    # Extract the core YY-NNN if possible, and add all prefix variants
+    m = re.match(r'^(\d{2})-(\d{3,4})-', lid)
+    if m:
+        yy, nnn = m.group(1), m.group(2)
+        variants.update({
+            f"{yy}-{nnn}",                  # "16-079"
+            f"A-{yy}-{nnn}",               # "A-16-079"
+            f"I-{yy}-{nnn}",               # "I-16-079"
+            f"M-{yy}-{nnn}",               # "M-16-079"
+        })
+
+    return variants
 
 
 # =============================================================================
@@ -181,13 +322,22 @@ class Extractor:
 
         # Extract filename from URL
         filename = pdf_url.rstrip("/").split("/")[-1]
-        if not filename.endswith(".pdf"):
+        if not filename.lower().endswith(".pdf"):
             filename += ".pdf"
 
-        pdf_path = RAW_PDFS_DIR / str(year) / filename
+        year_dir = RAW_PDFS_DIR / str(year)
+        pdf_path = year_dir / filename
 
         if pdf_path.exists():
             return pdf_path
+
+        # Case-insensitive fallback: scan directory for matching stem
+        if year_dir.is_dir():
+            target_stem = Path(filename).stem.lower()
+            for candidate in year_dir.iterdir():
+                if candidate.stem.lower() == target_stem and candidate.suffix.lower() == ".pdf":
+                    return candidate
+
         return None
 
     def extract_native(self, pdf_path: Path) -> dict:
@@ -313,7 +463,10 @@ class Extractor:
             if match:
                 try:
                     iso_date = formatter(match)
-                    return iso_date, match.group(0)
+                    # Validate year is in reasonable range (1975-2026)
+                    year_part = int(iso_date[:4])
+                    if 1975 <= year_part <= 2026:
+                        return iso_date, match.group(0)
                 except (ValueError, IndexError):
                     continue
 
@@ -421,10 +574,10 @@ class Extractor:
             FPPCDocument if successful, None if failed
         """
         doc_id = doc_row.get("id")
-        letter_id = doc_row.get("letter_id", "unknown")
+        letter_id = doc_row.get("letter_id") or None  # Treat empty string as None
         year = doc_row.get("year_tag", 0)
 
-        self._log(f"Processing {letter_id} ({year})...")
+        self._log(f"Processing {letter_id or f'doc#{doc_id}'} ({year})...")
 
         # Step 1: Find PDF
         pdf_path = self._get_pdf_path(doc_row)
@@ -442,6 +595,17 @@ class Extractor:
         text = native_result["text"]
         page_count = native_result["page_count"]
         native_word_count = native_result["word_count"]
+
+        # Step 2b: Recover letter_id from text if missing
+        if not letter_id and text:
+            letter_id = _extract_letter_id_from_text(text)
+            if letter_id:
+                self._log(f"  Recovered letter_id from text: {letter_id}")
+
+        # Final fallback: synthetic ID from year + DB primary key
+        if not letter_id:
+            letter_id = f"UNK-{year % 100:02d}-{doc_id:05d}"
+            self._log(f"  Using synthetic ID: {letter_id}")
 
         # Step 3: Quality assessment
         metrics = compute_quality_score(text, page_count)
@@ -480,6 +644,14 @@ class Extractor:
 
         # Step 6: Extract citations
         citations_result = extract_citations(text)
+
+        # Step 6b: Filter self-citations from prior opinions
+        if letter_id:
+            self_variants = _build_self_id_variants(letter_id)
+            citations_result.prior_opinions = [
+                op for op in citations_result.prior_opinions
+                if op.upper() not in self_variants
+            ]
 
         # Step 7: Classify topic
         classification_result = classify_by_citations(citations_result.government_code)
@@ -603,8 +775,9 @@ class Extractor:
         year_dir = EXTRACTED_DIR / str(doc.year)
         year_dir.mkdir(parents=True, exist_ok=True)
 
-        # Save JSON
-        json_path = year_dir / f"{doc.id}.json"
+        # Sanitize document ID for filesystem use
+        safe_id = re.sub(r'[^\w\-.]', '_', doc.id) if doc.id else f"unknown_{doc.year}"
+        json_path = year_dir / f"{safe_id}.json"
         json_content = to_json(doc)
 
         with open(json_path, "w", encoding="utf-8") as f:
