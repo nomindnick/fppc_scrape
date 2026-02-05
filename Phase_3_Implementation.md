@@ -36,7 +36,7 @@ The implementation is divided into discrete, sequential tasks:
 | **3.3** | `section_parser.py` | Regex section extraction with validation | None | ✓ Complete |
 | **3.4** | `citation_extractor.py` | Legal citation extraction | None | ✓ Complete |
 | **3.5** | `classifier.py` | Heuristic topic classification | 3.4 | ✓ Complete |
-| **3.6** | `db.py` additions | Add extraction tracking columns | None | |
+| **3.6** | `db.py` additions | Add extraction tracking columns | None | ✓ Complete |
 | **3.7** | `extractor.py` | Core extraction pipeline (Phase 3A) | 3.1-3.6 | |
 | **3.8** | Review & calibrate | Manual review of 50-doc sample | 3.7 | |
 | **3.9** | `llm_extractor.py` | LLM-based section extraction | 3.8 | |
