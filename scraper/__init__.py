@@ -5,6 +5,7 @@ from .db import init_db, get_stats, get_download_stats
 from .downloader import download_pending, print_download_stats
 from .citation_extractor import extract_citations, CitationResult
 from .section_parser import parse_sections, SectionResult
+from .classifier import classify_by_citations, ClassificationResult
 
 __all__ = [
     "DB_PATH",
@@ -20,4 +21,6 @@ __all__ = [
     "CitationResult",
     "parse_sections",
     "SectionResult",
+    "classify_by_citations",
+    "ClassificationResult",
 ]
