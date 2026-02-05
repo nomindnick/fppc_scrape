@@ -309,3 +309,150 @@ def get_download_stats() -> dict:
 
     conn.close()
     return stats
+
+
+def add_extraction_columns() -> None:
+    """
+    Add extraction tracking columns to the documents table.
+
+    Safe to call multiple times - silently ignores columns that already exist.
+    Run this before starting extraction to ensure schema is ready.
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    new_columns = [
+        ("extracted_at", "TEXT"),
+        ("section_confidence", "REAL"),
+        ("json_path", "TEXT"),
+        ("needs_llm_extraction", "INTEGER DEFAULT 0"),
+        ("llm_extracted_at", "TEXT"),
+    ]
+
+    for col_name, col_def in new_columns:
+        try:
+            cursor.execute(f"ALTER TABLE documents ADD COLUMN {col_name} {col_def}")
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+
+    conn.commit()
+    conn.close()
+
+
+def get_pending_extractions(year: int | None = None, limit: int | None = None) -> list[dict]:
+    """
+    Query documents ready for text extraction.
+
+    Args:
+        year: Optional year filter
+        limit: Optional limit on number of results
+
+    Returns:
+        List of document dicts (full row data)
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    query = """
+        SELECT * FROM documents
+        WHERE download_status = 'downloaded'
+        AND (extraction_status = 'pending' OR extraction_status IS NULL)
+    """
+    params: list = []
+
+    if year is not None:
+        query += " AND year_tag = ?"
+        params.append(year)
+
+    query += " ORDER BY year_tag DESC, id"
+
+    if limit is not None:
+        query += " LIMIT ?"
+        params.append(limit)
+
+    cursor.execute(query, params)
+    results = [dict(row) for row in cursor.fetchall()]
+    conn.close()
+    return results
+
+
+def get_documents_needing_llm(limit: int | None = None) -> list[dict]:
+    """
+    Query documents flagged for LLM-based extraction (Phase 3B).
+
+    Returns documents that:
+    - Have been extracted (extraction_status = 'extracted')
+    - Are flagged for LLM processing (needs_llm_extraction = 1)
+    - Haven't been LLM-processed yet (llm_extracted_at IS NULL)
+
+    Args:
+        limit: Optional limit on number of results
+
+    Returns:
+        List of document dicts (full row data)
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    query = """
+        SELECT * FROM documents
+        WHERE extraction_status = 'extracted'
+        AND needs_llm_extraction = 1
+        AND llm_extracted_at IS NULL
+        ORDER BY year_tag DESC, id
+    """
+
+    if limit is not None:
+        query += " LIMIT ?"
+        cursor.execute(query, (limit,))
+    else:
+        cursor.execute(query)
+
+    results = [dict(row) for row in cursor.fetchall()]
+    conn.close()
+    return results
+
+
+def update_extraction_status(
+    doc_id: int,
+    status: str,
+    method: str | None = None,
+    quality: float | None = None,
+    section_confidence: float | None = None,
+    json_path: str | None = None,
+    needs_llm: bool = False,
+) -> None:
+    """
+    Update extraction status and related fields for a document.
+
+    Args:
+        doc_id: Document ID
+        status: New extraction status ('extracted', 'error', 'pending')
+        method: Extraction method used ('native', 'olmocr', 'native+olmocr')
+        quality: Text quality score (0.0-1.0)
+        section_confidence: Section parsing confidence (0.0-1.0)
+        json_path: Path to the extracted JSON file
+        needs_llm: Whether document needs LLM extraction in Phase 3B
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute(
+        """
+        UPDATE documents
+        SET extraction_status = ?,
+            extracted_at = CURRENT_TIMESTAMP,
+            extraction_method = COALESCE(?, extraction_method),
+            extraction_quality = COALESCE(?, extraction_quality),
+            section_confidence = COALESCE(?, section_confidence),
+            json_path = COALESCE(?, json_path),
+            needs_llm_extraction = ?,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+        """,
+        (status, method, quality, section_confidence, json_path,
+         1 if needs_llm else 0, doc_id),
+    )
+
+    conn.commit()
+    conn.close()
