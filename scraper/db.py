@@ -456,3 +456,19 @@ def update_extraction_status(
 
     conn.commit()
     conn.close()
+
+
+def update_llm_extraction_status(doc_id: int, section_confidence: float) -> None:
+    """Mark a document as LLM-processed (Phase 3B)."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        UPDATE documents
+        SET llm_extracted_at = CURRENT_TIMESTAMP,
+            needs_llm_extraction = 0,
+            section_confidence = ?,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+    """, (section_confidence, doc_id))
+    conn.commit()
+    conn.close()
