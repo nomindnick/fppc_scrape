@@ -39,6 +39,7 @@ import anthropic
 from .config import DATA_DIR, PROJECT_ROOT
 from .db import get_connection, get_documents_needing_llm, update_llm_extraction_status
 from .schema import FPPCDocument, from_json, to_json
+from .section_parser import clean_section_content
 
 # =============================================================================
 # Constants
@@ -245,11 +246,12 @@ DOCUMENT TEXT:
         Always sets synthetic fields and updates embedding content.
         """
         # Update sections — only overwrite if regex found nothing
+        # Apply boilerplate cleaning to LLM-returned text
         if not doc.sections.question and llm_result.get("question"):
-            doc.sections.question = llm_result["question"]
+            doc.sections.question = clean_section_content(llm_result["question"])
 
         if not doc.sections.conclusion and llm_result.get("conclusion"):
-            doc.sections.conclusion = llm_result["conclusion"]
+            doc.sections.conclusion = clean_section_content(llm_result["conclusion"])
 
         # Always set synthetic fields
         doc.sections.question_synthetic = llm_result.get("question_synthetic")

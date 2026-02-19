@@ -35,7 +35,9 @@ from typing import Literal
 # =============================================================================
 
 # Minimum words for a section to be considered valid
-MIN_SECTION_WORDS = 10
+# Lowered from 10 to 1: valid conclusions can be very short (e.g., "No.")
+# Section header matching already provides strong gating against false positives.
+MIN_SECTION_WORDS = 1
 
 # Boilerplate patterns that bleed into section content (removed during cleaning)
 BOILERPLATE_PATTERNS = [
@@ -51,8 +53,10 @@ BOILERPLATE_PATTERNS = [
     r'[1ItI\'/]?\s*(?:The\s+)?[Rr]eg\w+\s+of\s+the\s+Fair\s+Political\s+Practices\s+Comm\w+\s+are\s+contained.*?(?:unless\s+otherwise\s+indicated|California\s+Code\s+of\s+Reg\w*)\.?\s*',
     # Combined PRA + regulation footnote (single block spanning both sentences)
     r'[1ItI\'/]?\s*(?:The\s+)?[Pp]olitical\s+[Rr]eform\s+[Aa]ct.*?(?:California\s+Code\s+of\s+Reg\w*|Code\s+of\s+Reg\w*)[\s\S]{0,50}?(?:unless\s+otherwise\s+indicated|otherwise\s+indicated)\.?\s*',
-    # Page headers with file numbers
-    r'File\s+No\.\s*[AIM]?-?\d{2}-?\d{3,4}\s*(?:/?\s*Page\s*(?:No\.)?\s*\d+)?',
+    # Page headers with file numbers (including OCR: A→4, I→1)
+    r'File\s+No\.\s*[AIM41]?-?\d{2}-?\d{3,4}\s*(?:[/\n]\s*Page\s*(?:No\.)?\s*\d+)?',
+    # Standalone "Re:" line with file number (another header variant)
+    r'\n\s*Re:\s+(?:Your\s+)?(?:File|Letter)\s+No\.?\s*[AIM]?-?\d{2}-?\d{3,4}',
     # FPPC address blocks
     r'(?:428\s+J\s+Street|1102\s+Q\s+Street).*?(?:\d{5}(?:-\d{4})?)',
     # Standalone page references
@@ -66,6 +70,13 @@ BOILERPLATE_PATTERNS = [
     r'Commission\s+regulations?\s+appear\s+at\s+.*?(?:Code\s+(?:of\s+)?Reg|Administrative\s+Code)\w*.*?(?:et\s+seq\.?|section\s+\d{4,5}).*?\s*',
     # Standalone statutory references sentence: "All statutory references are to the Government Code..."
     r'A[Il1J][Il1J]\s+statutory\s+references\s+ar[ec]\s+to\s+the\s+Government\s+Code.*?(?:unless\s+otherwise\s+indicated|otherwise\s+indicated)\.?\s*',
+    # Footnote leak at page boundary: "word2 Informal assistance does not provide..."
+    # The footnote number merges with the last word of previous content
+    r'\w+\d\s+Informal\s+assistance\s+does\s+not\s+provide.*?(?:subject\s+to\s+penalty|Commission\s+action|enforcement\s+action).*?\.?\s*',
+    # Standalone footnote: "2 Informal assistance does not provide..."
+    r'\n\s*\d\s+Informal\s+assistance\s+does\s+not\s+provide.*?(?:subject\s+to\s+penalty|Commission\s+action|enforcement\s+action).*?\.?\s*',
+    # FPPC letterhead that bleeds into sections (OCR-garbled)
+    r'(?:FAIR\s+POLITICAL\s+PRACTICES\s+COMMISSION|F\s*A\s*I\s*R\s*P\s*O\s*L\s*I\s*T\s*I\s*C\s*A\s*L).*?(?:Sacramento|SACRAMENTO).*?(?:\d{5})',
 ]
 
 # Section types we extract
@@ -139,6 +150,15 @@ SECTION_PATTERNS: list[tuple[str, SectionType, str]] = [
     (r'^[ \t]{0,4}A[I}\]\\NM]+[LA]*[LY]+S[IT1]S\s*[:\n]?$', 'analysis', 'ocr'),
     # ANA LYSIS — space inside
     (r'^[ \t]{0,4}ANA\s*LYSIS\s*[:\n]?$', 'analysis', 'ocr'),
+    # ANALYSN — I→N garble (from QA doc 09-261)
+    (r'^[ \t]{0,4}ANALYS[NI][SNI]?\s*[:\n]?$', 'analysis', 'ocr'),
+    # F'ACTS — apostrophe insertion (from QA doc 02-237)
+    (r'^[ \t]{0,4}F[\'`\u2019]?\s*ACTS\s*[:\n]?$', 'facts', 'ocr'),
+    # Roman numeral prefixed headers: "I. QUESTION", "II. CONCLUSION", "III. FACTS", "IV. ANALYSIS"
+    (r'^[ \t]{0,4}(?:I{1,4}|IV|V|VI{0,3})\.?\s+QUESTIONS?\s*[:\n]?$', 'question', 'numbered'),
+    (r'^[ \t]{0,4}(?:I{1,4}|IV|V|VI{0,3})\.?\s+(?:CONCLUSIONS?|SHORT\s+ANSWERS?)\s*[:\n]?$', 'conclusion', 'numbered'),
+    (r'^[ \t]{0,4}(?:I{1,4}|IV|V|VI{0,3})\.?\s+FACTS?\s*[:\n]?$', 'facts', 'numbered'),
+    (r'^[ \t]{0,4}(?:I{1,4}|IV|V|VI{0,3})\.?\s+(?:ANALYSIS|DISCUSSION)\s*[:\n]?$', 'analysis', 'numbered'),
 ]
 
 # Patterns that indicate end of document content (before signature)
@@ -154,6 +174,19 @@ DOCUMENT_END_PATTERNS = [
     # OCR-tolerant variants
     r'\n[ \t]*[Ss]incerely\s*[,.]',
     r'\n[ \t]*[Ss]incere[1l]y\s*[,.]',  # OCR: l→1
+    # Closing boilerplate — "If you have other questions on this matter..."
+    r'\n[ \t]*If you have (?:any )?(?:other |further |additional )?questions',
+    r'\n[ \t]*(?:However,?\s+)?[Ss]hould you have (?:any )?(?:other |further |additional )?questions',
+    r'\n[ \t]*If I can be of (?:any )?further (?:assistance|help)',
+    r'\n[ \t]*Please do not hesitate to (?:contact|call)',
+    r'\n[ \t]*If (?:we|I) can be of (?:any )?(?:additional )?assistance',
+    r'\n[ \t]*Please feel free to contact',
+    # "If you wish to file a complaint..."
+    r'\n[ \t]*If you wish to file a complaint',
+    # "I hope this response has been of assistance..." (older docs)
+    r'\n[ \t]*I\s+hope\s+(?:this|that(?:\s+this)?)\s+(?:response|letter|opinion)\s+(?:has\s+been|is)\s+(?:of\s+)?(?:assistance|helpful)',
+    # "I trust this answers/responds..." (older docs)
+    r'\n[ \t]*I\s+trust\s+(?:this|that)\s+(?:answers|responds|adequately)',
 ]
 
 
@@ -235,12 +268,18 @@ def _find_section_matches(text: str) -> list[SectionMatch]:
     return matches
 
 
-def _find_document_end(text: str) -> int | None:
+def _find_document_end(text: str, after: int = 0) -> int | None:
     """
     Find the position where document content ends (before signature block).
 
+    Searches for document end markers at or after the given position.
+    This is important because patterns like "Sincerely," may appear earlier
+    in quoted letters within the facts section — we need the end marker
+    that's relevant to each section's content.
+
     Args:
         text: The document text
+        after: Only consider matches at or after this position (default 0)
 
     Returns:
         Position of document end marker, or None if not found
@@ -248,10 +287,11 @@ def _find_document_end(text: str) -> int | None:
     earliest_end = None
 
     for pattern in DOCUMENT_END_PATTERNS:
-        match = re.search(pattern, text, re.IGNORECASE)
-        if match:
-            if earliest_end is None or match.start() < earliest_end:
-                earliest_end = match.start()
+        for match in re.finditer(pattern, text, re.IGNORECASE):
+            if match.start() >= after:
+                if earliest_end is None or match.start() < earliest_end:
+                    earliest_end = match.start()
+                break  # finditer returns in order; first match >= after suffices
 
     return earliest_end
 
@@ -290,7 +330,7 @@ def _find_section_end(
     return min(candidates)
 
 
-def _clean_section_content(content: str) -> str:
+def clean_section_content(content: str) -> str:
     """
     Clean up extracted section content.
 
@@ -358,8 +398,6 @@ def _validate_and_extract(
     extracted: dict[str, str] = {}
     issues: list[str] = []
 
-    document_end = _find_document_end(text)
-
     # Check ordering: question should come before conclusion
     question_pos = None
     conclusion_pos = None
@@ -376,12 +414,16 @@ def _validate_and_extract(
     # Extract content for each section
     for i, match in enumerate(matches):
         # Find where this section ends
+        # Per-section document end: search for end markers AFTER this section starts
+        # This prevents early matches (e.g., "Sincerely," in a quoted letter) from
+        # being ignored for later sections
+        document_end = _find_document_end(text, after=match.header_end)
         next_start = matches[i + 1].header_start if i + 1 < len(matches) else None
         section_end = _find_section_end(text, match.header_end, next_start, document_end)
 
         # Extract and clean content
         raw_content = text[match.header_end:section_end]
-        content = _clean_section_content(raw_content)
+        content = clean_section_content(raw_content)
 
         # Validate minimum content
         word_count = _count_words(content)

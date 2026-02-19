@@ -62,7 +62,7 @@ from .schema import (
     SourceMetadata,
     to_json,
 )
-from .section_parser import parse_sections
+from .section_parser import clean_section_content, parse_sections
 
 # =============================================================================
 # Constants
@@ -526,15 +526,15 @@ class Extractor:
         words = full_text.split()[:500]
         first_500 = " ".join(words)
 
-        # Build QA text from extracted sections
+        # Build QA text from extracted sections (apply boilerplate cleaning)
         parts = []
         qa_source = "extracted"
 
         if sections_result.question:
-            parts.append(f"QUESTION: {sections_result.question}")
+            parts.append(f"QUESTION: {clean_section_content(sections_result.question)}")
 
         if sections_result.conclusion:
-            parts.append(f"CONCLUSION: {sections_result.conclusion}")
+            parts.append(f"CONCLUSION: {clean_section_content(sections_result.conclusion)}")
 
         # If no Q/C sections found, use first 500 words and mark as needing synthesis
         if not parts:
@@ -547,6 +547,19 @@ class Extractor:
 
     def _determine_document_type(self, letter_id: str | None, text: str) -> str:
         """Determine document type from letter ID prefix or content."""
+        upper_text = text.upper()
+
+        # Check for withdrawal/decline letters first (overrides prefix-based detection)
+        withdrawal_patterns = [
+            r'WITHDRAW(?:N|AL|ING)\s+(?:YOUR|THE|THIS)\s+REQUEST',
+            r'DECLINE\s+TO\s+(?:ISSUE|PROVIDE)',
+            r'REQUEST\s+(?:HAS\s+BEEN|IS)\s+WITHDRAW',
+            r'WITHDRAWAL\s+OF\s+(?:YOUR\s+)?REQUEST',
+        ]
+        for pattern in withdrawal_patterns:
+            if re.search(pattern, upper_text[:5000]):
+                return "correspondence"
+
         if letter_id:
             if letter_id.startswith("A-"):
                 return "advice_letter"
@@ -556,9 +569,9 @@ class Extractor:
                 return "opinion"
 
         # Fallback to content analysis
-        if "INFORMAL ASSISTANCE" in text.upper():
+        if "INFORMAL ASSISTANCE" in upper_text:
             return "informal_advice"
-        if "FORMAL OPINION" in text.upper():
+        if "FORMAL OPINION" in upper_text:
             return "opinion"
 
         return "advice_letter"  # Default
