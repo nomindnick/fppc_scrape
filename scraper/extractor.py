@@ -263,15 +263,17 @@ class Extractor:
     structured JSON documents with sections, citations, and classifications.
     """
 
-    def __init__(self, skip_olmocr: bool = False, verbose: bool = True):
+    def __init__(self, skip_olmocr: bool = False, force_olmocr: bool = False, verbose: bool = True):
         """
         Initialize the extractor.
 
         Args:
             skip_olmocr: If True, skip olmOCR even for poor quality extractions
+            force_olmocr: If True, always attempt olmOCR regardless of quality heuristics
             verbose: If True, print progress information
         """
         self.skip_olmocr = skip_olmocr
+        self.force_olmocr = force_olmocr
         self.verbose = verbose
         self._olmocr_client = None
 
@@ -628,7 +630,7 @@ class Extractor:
         olmocr_cost = None
         markdown_text = None
 
-        if not self.skip_olmocr and should_use_olmocr(year, metrics):
+        if not self.skip_olmocr and (self.force_olmocr or should_use_olmocr(year, metrics)):
             self._log(f"  Quality score {metrics.final_score:.2f} - trying olmOCR...")
             olmocr_result = self.extract_olmocr(pdf_path)
 

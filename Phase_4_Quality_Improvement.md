@@ -12,15 +12,27 @@ Phase 4 addresses this through three sequential efforts:
 
 ### Corpus Quality Distribution (v3 scoring)
 
+**Pre-reextraction (baseline):**
+
 | Score Range | Documents | % | Description |
 |---|---|---|---|
-| 0.00 – 0.50 | 338 | 2.4% | Broken — failed extraction, garbage text |
-| 0.50 – 0.70 | 1,000 | 7.1% | Degraded — heavy character corruption, missing content |
-| 0.70 – 0.80 | 1,559 | 11.1% | Impaired — noticeable OCR errors throughout |
-| 0.80 – 0.90 | 2,878 | 20.4% | Minor issues — occasional wrong characters |
-| 0.90 – 1.00 | 8,321 | 59.0% | Clean — fully readable |
+| 0.00 - 0.50 | 338 | 2.4% | Broken -- failed extraction, garbage text |
+| 0.50 - 0.70 | 1,000 | 7.1% | Degraded -- heavy character corruption, missing content |
+| 0.70 - 0.80 | 1,559 | 11.1% | Impaired -- noticeable OCR errors throughout |
+| 0.80 - 0.90 | 2,878 | 20.4% | Minor issues -- occasional wrong characters |
+| 0.90 - 1.00 | 8,321 | 59.0% | Clean -- fully readable |
 
-### Quality by Decade
+**Post-reextraction (after Task 4.4):**
+
+| Score Range | Documents | % | Description |
+|---|---|---|---|
+| 0.00 - 0.50 | 9 | 0.1% | Broken -- irreducible (1979-era degraded scans) |
+| 0.50 - 0.70 | 11 | 0.1% | Degraded -- source material limits |
+| 0.70 - 0.80 | 172 | 1.2% | Impaired -- mostly already-OCR'd, best achievable |
+| 0.80 - 0.90 | 3,908 | 27.7% | Minor issues -- occasional wrong characters |
+| 0.90 - 1.00 | 9,996 | 70.9% | Clean -- fully readable |
+
+### Quality by Decade (pre-reextraction baseline)
 
 | Decade | Docs | Mean Score | Below 0.80 |
 |---|---|---|---|
@@ -31,7 +43,7 @@ Phase 4 addresses this through three sequential efforts:
 | 2010s | 1,962 | 0.954 | 37 (2%) |
 | 2020s | 668 | 0.969 | 0 (0%) |
 
-**Key finding:** The 1990s are worse than the 1980s (0.848 vs 0.901 mean). The pre-1990 year trigger sent 1980s scans through olmOCR, but 1990s documents were assumed to be born-digital. Many 1990s PDFs have font encoding issues that produce character-level corruption (e.g., `rn`→`m`, `l`→`1`).
+**Key finding:** The 1990s were worse than the 1980s (0.848 vs 0.901 mean). The pre-1990 year trigger sent 1980s scans through olmOCR, but 1990s documents were assumed to be born-digital. Many 1990s PDFs had font encoding issues that produce character-level corruption (e.g., `rn`->`m`, `l`->`1`). Task 4.4 re-extraction resolved the vast majority of these.
 
 ---
 
@@ -143,74 +155,50 @@ The `QualityMetrics` dataclass fields changed. The only external consumer is `ex
 
 ---
 
-## Task 4.4: Corpus Re-extraction
+## Task 4.4: Corpus Re-extraction ✓ COMPLETE
 
 **Objective:** Re-process all documents scoring below 0.80 through OCR, re-run the full extraction pipeline, and update the corpus in place.
 
-**Status:** Not started
+**Status:** Complete (2026-02-23)
+**Full report:** `data/qa_reports/task_4_4_reextraction_report.md`
 
-### Scope
+### What Changed
 
-~2,897 documents below 0.80 threshold:
-- 338 below 0.50 (broken)
-- 1,000 in 0.50-0.70 (degraded)
-- 1,559 in 0.70-0.80 (impaired)
+**`scraper/extractor.py`** — Added `force_olmocr` parameter (3 lines) to bypass the `should_use_olmocr()` heuristics and force every document through OCR. Backward-compatible: existing behavior preserved when `force_olmocr=False`.
 
-### Script
+**`scripts/reocr_corpus.py`** — New ~240-line batch re-extraction script with:
+- Discovery phase (rescores all docs with v3 to find true candidates)
+- Re-extraction phase (worst-first, double safety net, resumable with `--skip-already-ocr`)
+- CLI: `--threshold`, `--limit`, `--max-cost`, `--dry-run`, `--skip-already-ocr`
 
-**`scripts/reocr_corpus.py`** — follows the `fix_low_density.py` pattern:
+### Results
 
-```
-python scripts/reocr_corpus.py --dry-run                      # Preview + cost estimate
-python scripts/reocr_corpus.py --dry-run --threshold 0.70     # Narrower scope
-python scripts/reocr_corpus.py                                # Run with olmOCR-2
-python scripts/reocr_corpus.py --limit 500                    # Batch of 500
-```
+| Metric | Value |
+|---|---|
+| Candidates identified | 2,897 |
+| Documents improved | 2,568 (99.0%) |
+| Documents unchanged | 24 |
+| Errors | 0 |
+| Regressions | 0 |
+| Total olmOCR cost | ~$24 |
 
-**Flags:**
-- `--threshold` (default: 0.80) — v3 quality score cutoff
-- `--limit N` — process N documents per run (for batching)
-- `--max-cost` — halt if cumulative cost exceeds limit (safety)
-- `--dry-run` — preview document list and cost estimate without processing
+### Quality Distribution Before → After
 
-### Process per Document
+| Score Range | Before | After | Change |
+|---|---|---|---|
+| < 0.50 (broken) | 338 | 9 | -97% |
+| 0.50 - 0.70 (degraded) | 1,000 | 11 | -99% |
+| 0.70 - 0.80 (impaired) | 1,559 | 172 | -89% |
+| 0.80 - 0.90 (minor issues) | 2,878 | 3,908 | +36% |
+| 0.90+ (clean) | 8,321 | 9,996 | +20% |
 
-1. Query DB for documents with `extraction_quality < threshold` (using current v1 scores in DB)
-2. **Rescore with v3** to get accurate current quality (v1 scores in DB are stale)
-3. Filter to documents actually below threshold on v3 scoring
-4. For each document:
-   a. Render PDF pages to PNG
-   b. Send to OCR model
-   c. Compare OCR output quality vs. existing quality
-   d. If improved: re-run full pipeline (`process_document()`) with new text
-   e. Update JSON file and DB record
-5. Log: old quality → new quality, cost, method
+**Corpus usability: 79.4% → 98.6%** (documents scoring >= 0.80).
 
-### Corpus Update Strategy
+The remaining 192 below-threshold documents are mostly already-OCR'd 1979-era scans — source material limitations that no OCR model can overcome.
 
-- **In-place updates** — overwrite existing JSON files and DB records
-- **Backup first**: `cp data/documents.db data/documents.db.bak-YYYYMMDD`
-- **Track method**: `extraction_method` field records which OCR model was used
-- **Rollback path**: PDFs are immutable source of truth; can always re-extract from scratch
+### Cost vs Estimate
 
-### Cost Estimation
-
-Based on benchmark actuals (Task 4.2): olmOCR-2 costs ~$0.0006/doc at 3 pages.
-
-| Docs | Pages | Est. Cost |
-|---|---|---|
-| 2,897 (all <0.80) | ~8,700 | **~$2.84** |
-| 1,338 (all <0.70) | ~4,000 | ~$1.31 |
-| 338 (all <0.50) | ~1,000 | ~$0.33 |
-
-Cost is negligible. No need to batch or tier.
-
-### Post-processing
-
-After re-extraction:
-1. Re-run `scripts/qa_corpus_validate.py` to verify quality improvements
-2. Re-run `scripts/build_citation_graph.py` to update citation indexes
-3. Check for regressions: any documents where quality *decreased*?
+Actual cost (~$24) was higher than estimated (~$2.84) due to underestimated page counts and per-page costs. Still negligible for the quality improvement achieved.
 
 ---
 
@@ -240,11 +228,11 @@ Can run independently of re-extraction (useful for documents that weren't re-OCR
 
 | Step | Task | Depends On | Status |
 |---|---|---|---|
-| 1 | 4.1 Quality Rescoring | — | ✓ Complete |
-| 2 | 4.2 OCR Engine Benchmark | 4.1 | ✓ Complete — olmOCR-2 wins decisively |
-| 3 | ~~4.3 Pipeline Parameterization~~ | — | Skipped — olmOCR already in pipeline |
-| 4 | 4.4 Corpus Re-extraction | 4.2 | Next — ~$2.84 API cost |
+| 1 | 4.1 Quality Rescoring | -- | ✓ Complete |
+| 2 | 4.2 OCR Engine Benchmark | 4.1 | ✓ Complete -- olmOCR-2 wins decisively |
+| 3 | ~~4.3 Pipeline Parameterization~~ | -- | Skipped -- olmOCR already in pipeline |
+| 4 | 4.4 Corpus Re-extraction | 4.2 | ✓ Complete -- 2,568 docs improved, 98.6% usable |
 | 5 | 4.5 Quality Score Backfill | 4.4 | Not started |
 | 6 | QA Validation | 4.4, 4.5 | Not started |
 
-**Total estimated API cost:** ~$3 (olmOCR-2 for all 2,897 docs).
+**Total API cost so far:** ~$24 (olmOCR-2 for 2,897 candidate docs across Task 4.4).
