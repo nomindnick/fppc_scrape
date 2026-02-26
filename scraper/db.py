@@ -339,6 +339,106 @@ def add_extraction_columns() -> None:
     conn.close()
 
 
+def add_fidelity_columns() -> None:
+    """
+    Add fidelity verification columns to the documents table.
+
+    Columns:
+        fidelity_score  — 0.0-1.0, how closely extraction matches source PDF
+        fidelity_method — how fidelity was assessed (tesseract_canary, haiku_verified, native_trusted)
+        fidelity_risk   — tier label (critical, high, medium, low, verified)
+
+    Safe to call multiple times.
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    new_columns = [
+        ("fidelity_score", "REAL"),
+        ("fidelity_method", "TEXT"),
+        ("fidelity_risk", "TEXT"),
+    ]
+
+    for col_name, col_def in new_columns:
+        try:
+            cursor.execute(f"ALTER TABLE documents ADD COLUMN {col_name} {col_def}")
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+
+    conn.commit()
+    conn.close()
+
+
+def backfill_native_fidelity() -> int:
+    """
+    Backfill fidelity for native-extracted docs (PyMuPDF extracts embedded text directly).
+
+    Native extraction is deterministic and faithful — it reads the actual text
+    layer from the PDF, so fidelity_score=1.0 is correct.
+
+    Returns:
+        Number of rows updated.
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        UPDATE documents
+        SET fidelity_score = 1.0,
+            fidelity_method = 'native_trusted',
+            fidelity_risk = 'verified'
+        WHERE extraction_status = 'extracted'
+        AND extraction_method = 'native'
+        AND fidelity_score IS NULL
+    """)
+    updated = cursor.rowcount
+
+    # native+olmocr means olmOCR was tried but native was kept — same trust level
+    cursor.execute("""
+        UPDATE documents
+        SET fidelity_score = 1.0,
+            fidelity_method = 'native_trusted',
+            fidelity_risk = 'verified'
+        WHERE extraction_status = 'extracted'
+        AND extraction_method = 'native+olmocr'
+        AND fidelity_score IS NULL
+    """)
+    updated += cursor.rowcount
+
+    conn.commit()
+    conn.close()
+    return updated
+
+
+def update_fidelity(
+    doc_id: int,
+    score: float,
+    method: str,
+    risk: str,
+) -> None:
+    """
+    Update fidelity verification fields for a document.
+
+    Args:
+        doc_id: Document ID
+        score: Fidelity score 0.0-1.0
+        method: Assessment method (tesseract_canary, haiku_verified, tesseract_fallback)
+        risk: Risk tier (critical, high, medium, low, verified)
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        UPDATE documents
+        SET fidelity_score = ?,
+            fidelity_method = ?,
+            fidelity_risk = ?,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+    """, (score, method, risk, doc_id))
+    conn.commit()
+    conn.close()
+
+
 def get_pending_extractions(year: int | None = None, limit: int | None = None) -> list[dict]:
     """
     Query documents ready for text extraction.
